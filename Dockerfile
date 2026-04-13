@@ -1,7 +1,7 @@
 # parameters
-ARG REPO_NAME="DuckieTown jamBot"
-ARG DESCRIPTION="DuckieTown end of year project"
-ARG MAINTAINER="Mitali D (mitalidesh7@gmail.com)"
+ARG REPO_NAME="duckietown"
+ARG DESCRIPTION="project"
+ARG MAINTAINER="Mitali"
 # pick an icon from: https://fontawesome.com/v4.7.0/icons/
 ARG ICON="cube"
 
