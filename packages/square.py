@@ -6,13 +6,9 @@ from duckietown_msgs.msg import WheelsCmdStamped
 
 class SquareDriverNode(DTROS):
     def __init__(self, node_name):
-        # Initialize the DTROS parent class
         super(SquareDriverNode, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
         
-        # Get the vehicle name from the environment variable (reliable fallback)
         self.veh = os.environ.get('VEHICLE_NAME', 'duckiebot')
-        
-        # Target the wheels driver directly to bypass kinematics and FSM blocks
         topic_name = f"/{self.veh}/wheels_driver_node/wheels_cmd"
         
         self.pub_cmd = rospy.Publisher(topic_name, WheelsCmdStamped, queue_size=1)
@@ -21,10 +17,9 @@ class SquareDriverNode(DTROS):
         """Publishes raw wheel commands for a set duration."""
         msg = WheelsCmdStamped(vel_left=vel_left, vel_right=vel_right)
         
-        rate = rospy.Rate(10) # 10 Hz publishing rate
+        rate = rospy.Rate(10)
         start_time = rospy.get_time()
         
-        # Keep publishing until the duration is reached or ROS shuts down
         while not rospy.is_shutdown() and (rospy.get_time() - start_time) < duration:
             self.pub_cmd.publish(msg)
             rate.sleep()
@@ -34,20 +29,22 @@ class SquareDriverNode(DTROS):
         self.send_cmd(vel_left=0.0, vel_right=0.0, duration=0.5)
 
     def execute_square(self):
-        # Wait a moment for publishers to establish a connection
         rospy.sleep(1.0) 
         
         rospy.loginfo("Starting square trajectory...")
         for i in range(4):
-            # 1. Drive forward (both wheels moving forward at 50% speed)
+            # 1. Drive forward (~1 foot)
             rospy.loginfo(f"Side {i+1}: Driving straight...")
-            self.send_cmd(vel_left=0.5, vel_right=0.5, duration=2.0)
+            # I lowered the duration from 2.0 to 0.8. You may need to tune this 
+            # slightly depending on how fast 50% speed is for your specific bot.
+            self.send_cmd(vel_left=0.5, vel_right=0.5, duration=0.8)
             self.stop()
             
-            # 2. Turn 90 degrees (left wheel forward, right wheel backward)
-            rospy.loginfo(f"Side {i+1}: Turning 90 degrees...")
-            # Changed duration from 0.8 to 0.4 to cut the 180-degree turn in half
-            self.send_cmd(vel_left=0.5, vel_right=-0.5, duration=0.4) 
+            # 2. Pivot Turn 90 degrees LEFT (Left wheel STOPPED, Right wheel FORWARD)
+            rospy.loginfo(f"Side {i+1}: Pivot turning left...")
+            # Since only one wheel is pushing, the turn is slower. 
+            # I set it to 0.5 seconds, but tune this if it over/under rotates.
+            self.send_cmd(vel_left=0.0, vel_right=0.5, duration=0.5) 
             self.stop()
             
         rospy.loginfo("Square completed.")
@@ -63,4 +60,5 @@ if __name__ == '__main__':
         node.execute_square()
     except rospy.ROSInterruptException:
         pass
+
 
