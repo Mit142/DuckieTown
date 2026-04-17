@@ -31,3 +31,32 @@ class SquareDriverNode(DTROS):
             rate.sleep()
             
     def stop(self):
+
+          """Halts the robot briefly to prevent drift before the next move."""
+        self.send_cmd(0.0, 0.0, 0.5)
+
+    def execute_square(self):
+        # Wait a moment for publishers to establish a connection
+        rospy.sleep(1.0) 
+        
+        rospy.loginfo("Starting square trajectory...")
+        for _ in range(4):
+            # 1. Drive forward (v: speed, omega: 0)
+            rospy.loginfo("Driving straight...")
+            self.send_cmd(v=0.3, omega=0.0, duration=2.0)
+            self.stop()
+            
+            # 2. Turn 90 degrees (v: 0, omega: turn speed)
+            # 1.57 rad/s for 1 second is theoretically 90 degrees
+            rospy.loginfo("Turning 90 degrees...")
+            self.send_cmd(v=0.0, omega=1.57, duration=1.0) 
+            self.stop()
+            
+        rospy.loginfo("Square completed.")
+
+if __name__ == '__main__':
+    node = SquareDriverNode(node_name="square_driver_node")
+    try:
+        node.execute_square()
+    except rospy.ROSInterruptException:
+        pass
