@@ -46,9 +46,8 @@ class SquareDriverNode(DTROS):
             
             # 2. Turn 90 degrees (left wheel forward, right wheel backward)
             rospy.loginfo(f"Side {i+1}: Turning 90 degrees...")
-            # NOTE: You will likely need to tune the duration below (0.8) 
-            # to achieve exactly a 90-degree turn based on your bot's battery/motors.
-            self.send_cmd(vel_left=0.5, vel_right=-0.5, duration=0.8) 
+            # Changed duration from 0.8 to 0.4 to cut the 180-degree turn in half
+            self.send_cmd(vel_left=0.5, vel_right=-0.5, duration=0.4) 
             self.stop()
             
         rospy.loginfo("Square completed.")
