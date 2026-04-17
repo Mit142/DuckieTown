@@ -31,8 +31,7 @@ class SquareDriverNode(DTROS):
             rate.sleep()
             
     def stop(self):
-
-          """Halts the robot briefly to prevent drift before the next move."""
+        """Halts the robot briefly to prevent drift before the next move."""
         self.send_cmd(0.0, 0.0, 0.5)
 
     def execute_square(self):
