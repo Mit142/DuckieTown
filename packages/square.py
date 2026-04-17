@@ -5,16 +5,15 @@ from duckietown_msgs.msg import Twist2DStamped
 
 class SquareDriverNode(DTROS):
     def __init__(self, node_name):
-        # Initialize the DTROS parent class (Standard for 'ente')
         super(SquareDriverNode, self).__init__(node_name=node_name, node_type=NodeType.CONTROL)
         
-        # Get the vehicle name dynamically from the environment namespace
         self.veh = rospy.get_namespace().strip("/")
         if not self.veh:
-            self.veh = "duckiebot" # Fallback if not launched with a standard namespace
+            self.veh = "duckiebot" 
             
-        # Target the switch node to bypass the joystick and accept programmatic commands
-        topic_name = f"/{self.veh}/car_cmd_switch_node/cmd"
+        # FIX 1: We "spoof" the joystick topic. The robot's state machine 
+        # is usually listening here by default and won't block the commands.
+        topic_name = f"/{self.veh}/joy_mapper_node/car_cmd"
         self.pub_cmd = rospy.Publisher(topic_name, Twist2DStamped, queue_size=10)
 
     def send_cmd(self, v, omega, duration):
@@ -27,6 +26,10 @@ class SquareDriverNode(DTROS):
         end_time = rospy.Time.now() + rospy.Duration(duration)
         
         while rospy.Time.now() < end_time and not rospy.is_shutdown():
+            # FIX 2: You MUST update the timestamp right before publishing!
+            # If you don't do this, the robot ignores it as a "stale" safety hazard.
+            msg.header.stamp = rospy.Time.now()
+            
             self.pub_cmd.publish(msg)
             rate.sleep()
             
@@ -39,15 +42,14 @@ class SquareDriverNode(DTROS):
         rospy.sleep(1.0) 
         
         rospy.loginfo("Starting square trajectory...")
-        for _ in range(4):
+        for i in range(4):
             # 1. Drive forward (v: speed, omega: 0)
-            rospy.loginfo("Driving straight...")
+            rospy.loginfo(f"Side {i+1}: Driving straight...")
             self.send_cmd(v=0.3, omega=0.0, duration=2.0)
             self.stop()
             
             # 2. Turn 90 degrees (v: 0, omega: turn speed)
-            # 1.57 rad/s for 1 second is theoretically 90 degrees
-            rospy.loginfo("Turning 90 degrees...")
+            rospy.loginfo(f"Side {i+1}: Turning 90 degrees...")
             self.send_cmd(v=0.0, omega=1.57, duration=1.0) 
             self.stop()
             
