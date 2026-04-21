@@ -33,7 +33,6 @@ class SquareDriverNode(DTROS):
         
         rospy.loginfo("Starting square trajectory...")
         # 1. Drive forward
-        rospy.loginfo(f"Side {i+1}: Driving straight...")
         self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
         self.stop()
         for i in range(4):
