@@ -8,7 +8,7 @@ class SquareDriverNode(DTROS):
     def __init__(self, node_name):
         super(SquareDriverNode, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
         
-        # FIXED: Hardcoded your robot's exact name
+        # Hardcoded robot's exact name
         self.veh = 'entebot208' 
         topic_name = f"/{self.veh}/wheels_driver_node/wheels_cmd"
         
@@ -29,13 +29,12 @@ class SquareDriverNode(DTROS):
         """Halts the robot briefly to prevent drift before the next move."""
         self.send_cmd(vel_left=0.0, vel_right=0.0, duration=0.5)
 
-    # FIXED: Indented properly inside the class
     def execute_square(self):
         rospy.sleep(1.0) 
         
         rospy.loginfo("Starting square trajectory...")
         
-        # FIXED: The loop logic
+        # 4 Sides of the Square
         for i in range(4):
             # 1. Drive forward
             rospy.loginfo(f"Side {i+1}: Driving straight...")
@@ -49,6 +48,19 @@ class SquareDriverNode(DTROS):
             
         rospy.loginfo("Square completed!")
         
+        # --- NEW ADDITION: Final Straightaway ---
+        rospy.loginfo("Final move: Driving straight one last time...")
+        self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
+        
+        # --- NEW ADDITION: The "Anti-Spin" Stop ---
+        rospy.loginfo("Halting motors...")
+        self.stop()
+        
+        # This 1-second pause prevents the node from dying before the stop message 
+        # reaches the wheels. It cures the endless spinning!
+        rospy.sleep(1.0) 
+        rospy.loginfo("Program finished safely.")
+        
     def on_shutdown(self):
         """Safety catch: Ensure wheels stop if the node is forcibly shut down."""
         rospy.loginfo("Shutting down... stopping motors.")
@@ -60,4 +72,5 @@ if __name__ == '__main__':
         node.execute_square()
     except rospy.ROSInterruptException:
         pass
+
 
