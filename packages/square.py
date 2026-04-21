@@ -32,6 +32,8 @@ class SquareDriverNode(DTROS):
         rospy.sleep(1.0) 
         
         rospy.loginfo("Starting square trajectory...")
+        self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
+        self.stop()
         for i in range(4):
             # 1. Drive forward
             rospy.loginfo(f"Side {i+1}: Driving straight...")
@@ -51,8 +53,6 @@ class SquareDriverNode(DTROS):
 if __name__ == '__main__':
     node = SquareDriverNode(node_name="square_driver_node")
     try:
-        self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
-        self.stop()
         node.execute_square()
     except rospy.ROSInterruptException:
         pass
