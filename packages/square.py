@@ -40,25 +40,25 @@ if __name__ == '__main__':
         # --- SIDE 1 ---
         node.send_cmd(0.7, 0.7, 1.5) # Straight
         node.stop()
-        node.send_cmd(0.0, 0.5, 0.8) # Turn
+        node.send_cmd(-0.5, 0.5, 0.8) # Turn
         node.stop()
 
         # --- SIDE 2 ---
         node.send_cmd(0.7, 0.7, 1.5) # Straight
         node.stop()
-        node.send_cmd(0.0, 0.5, 0.8) # Turn
+        node.send_cmd(-0.5, 0.5, 0.8) # Turn
         node.stop()
 
         # --- SIDE 3 ---
         node.send_cmd(0.7, 0.7, 1.5) # Straight
         node.stop()
-        node.send_cmd(0.0, 0.5, 0.8) # Turn
+        node.send_cmd(-0.5, 0.5, 0.8) # Turn
         node.stop()
 
         # --- SIDE 4 ---
         node.send_cmd(0.7, 0.7, 1.5) # Straight
         node.stop()
-        node.send_cmd(0.0, 0.5, 0.8) # Turn
+        node.send_cmd(-0.5, 0.5, 0.8) # Turn
         
         # FINAL SAFETY STOP
         node.stop(duration=1.0)
