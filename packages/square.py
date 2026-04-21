@@ -1,74 +1,97 @@
+#!/usr/bin/env python3
+# Update NODE_VERSION on every change (see CLAUDE.md § Versioning)
+NODE_VERSION = "2.0.0"
+import os
 import rospy
+from duckietown.dtros import DTROS, NodeType
 from duckietown_msgs.msg import Twist2DStamped
-import time
+from std_msgs.msg import String
 
-VEHICLE_NAME  = "entebot208"
+SQUARE_SIDES        = 4
+FORWARD_SPEED       = 0.2    # m/s — same as your circle code
+FORWARD_DURATION    = 2.0    # seconds per side (tune to taste)
+TURN_SPEED          = 2.0    # rad/s — same omega as your circle code
+TURN_DURATION       = 0.785  # seconds → 2.0 × 0.785 ≈ 1.57 rad ≈ 90°
+STOP_DURATION       = 0.3    # brief pause between moves
 
-LINEAR_SPEED  = 0.3    # m/s
-FORWARD_TIME  = 2.0    # seconds per side
+class ShapeDriverNode(DTROS):
+    def __init__(self, node_name):
+        super(ShapeDriverNode, self).__init__(node_name=node_name, node_type=NodeType.CONTROL)
+        self.veh = os.environ.get("VEHICLE_NAME", "duckiebot")
+        self.pub_car_cmd = rospy.Publisher(
+            f"/{self.veh}/car_cmd_switch_node/cmd",
+            Twist2DStamped,
+            queue_size=1
+        )
+        rospy.Subscriber(
+            f"/{self.veh}/shape_driver_node/command",
+            String,
+            self.cb_command
+        )
+        self.current_shape = "square"
+        self.log(f"Shape Driver v{NODE_VERSION} ready. Will drive in a square.")
 
-ANGULAR_SPEED = 0.785  # rad/s (π/4)
-TURN_TIME     = 2.0    # seconds → ~90°
+    def cb_command(self, msg):
+        cmd = msg.data.strip().lower()
+        if cmd in ["square", "stop"]:
+            self.current_shape = cmd
+            self.log(f"Switching to: {cmd}")
+        else:
+            self.log(f"Unknown command: {cmd}")
 
-PAUSE_TIME    = 0.5
+    def publish_cmd(self, v, omega):
+        msg = Twist2DStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.v     = v
+        msg.omega = omega
+        self.pub_car_cmd.publish(msg)
 
+    def drive_timed(self, v, omega, duration):
+        """Publish a command for a fixed duration, checking for shutdown."""
+        t_end = rospy.Time.now() + rospy.Duration(duration)
+        while rospy.Time.now() < t_end:
+            if rospy.is_shutdown() or self.current_shape != "square":
+                return
+            self.publish_cmd(v, omega)
+            rospy.sleep(0.1)
 
-def stop(pub):
-    msg = Twist2DStamped()
-    msg.v     = 0.0
-    msg.omega = 0.0
-    pub.publish(msg)
-    rospy.sleep(PAUSE_TIME)
+    def drive_square(self):
+        self.log("Starting square...")
+        for side in range(SQUARE_SIDES):
+            if rospy.is_shutdown() or self.current_shape != "square":
+                return
 
+            # 1. Drive straight
+            self.log(f"Side {side + 1}/{SQUARE_SIDES} — driving forward")
+            self.drive_timed(FORWARD_SPEED, 0.0, FORWARD_DURATION)
 
-def drive_square():
-    rospy.init_node("drive_square_node", anonymous=True)
+            # 2. Stop briefly
+            self.drive_timed(0.0, 0.0, STOP_DURATION)
 
-    # Correct Duckietown daffy topic
-    topic = f"/{VEHICLE_NAME}/kinematics_node/velocity"
-    pub   = rospy.Publisher(topic, Twist2DStamped, queue_size=10)
+            # 3. Turn 90°
+            self.log(f"Side {side + 1}/{SQUARE_SIDES} — turning 90°")
+            self.drive_timed(0.0, TURN_SPEED, TURN_DURATION)
 
-    rospy.loginfo(f"Publishing to: {topic}")
-    rospy.sleep(1.0)
+            # 4. Stop briefly
+            self.drive_timed(0.0, 0.0, STOP_DURATION)
 
-    rate = rospy.Rate(10)
+        self.log("Square complete! Stopping.")
+        self.current_shape = "stop"
 
-    for side in range(4):
-        if rospy.is_shutdown():
-            break
+    def run(self):
+        while not rospy.is_shutdown():
+            if self.current_shape == "square":
+                self.drive_square()
+            elif self.current_shape == "stop":
+                self.publish_cmd(0.0, 0.0)
+                rospy.sleep(0.1)
 
-        # ── 1. Drive forward ──────────────────────────────
-        rospy.loginfo(f"Side {side + 1}/4 — driving forward")
-        msg            = Twist2DStamped()
-        msg.v          = LINEAR_SPEED
-        msg.omega      = 0.0
+    def on_shutdown(self):
+        self.publish_cmd(0.0, 0.0)
+        super(ShapeDriverNode, self).on_shutdown()
 
-        t_start = time.time()
-        while time.time() - t_start < FORWARD_TIME and not rospy.is_shutdown():
-            pub.publish(msg)
-            rate.sleep()
+if __name__ == '__main__':
+    node = ShapeDriverNode(node_name='shape_driver_node')
+    node.run()
 
-        stop(pub)
-
-        # ── 2. Turn 90° ───────────────────────────────────
-        rospy.loginfo(f"Side {side + 1}/4 — turning 90°")
-        msg            = Twist2DStamped()
-        msg.v          = 0.0
-        msg.omega      = ANGULAR_SPEED
-
-        t_start = time.time()
-        while time.time() - t_start < TURN_TIME and not rospy.is_shutdown():
-            pub.publish(msg)
-            rate.sleep()
-
-        stop(pub)
-
-    rospy.loginfo("Square complete!")
-
-
-if __name__ == "__main__":
-    try:
-        drive_square()
-    except rospy.ROSInterruptException:
-        pass
 
