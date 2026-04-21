@@ -1,85 +1,53 @@
 #!/usr/bin/env python3
-
-# Update NODE_VERSION on every change (see CLAUDE.md § Versioning)
-NODE_VERSION = "1.3.0"
-
-import os
 import rospy
-from duckietown.dtros import DTROS, NodeType
-from duckietown_msgs.msg import Twist2DStamped
-from std_msgs.msg import String
+from geometry_msgs.msg import Twist
+import time
 
-CIRCLE_LAPS = 2
-CIRCLE_LAP_DURATION = 8.0  # seconds per lap (tune to taste)
+def move_square():
+    rospy.init_node('square_driver')
+    pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
 
+    move_cmd = Twist()
 
-class ShapeDriverNode(DTROS):
-    def __init__(self, node_name):
-        super(ShapeDriverNode, self).__init__(node_name=node_name, node_type=NodeType.CONTROL)
-        self.veh = os.environ.get("VEHICLE_NAME", "entebot208")
+    # Parameters (tune these for your robot)
+    forward_speed = 0.2   # meters per second
+    turn_speed = 0.5      # radians per second
 
-        self.pub_car_cmd = rospy.Publisher(
-            f"/{self.veh}/car_cmd_switch_node/cmd",
-            Twist2DStamped,
-            queue_size=1
-        )
+    forward_time = 2.0    # time to move one side
+    turn_time = 1.57 / turn_speed  # time to turn ~90 degrees
 
-        rospy.Subscriber(
-            f"/{self.veh}/shape_driver_node/command",
-            String,
-            self.cb_command
-        )
+    rospy.sleep(1)  # wait for publisher to connect
 
-        self.current_shape = "circle"
-        self.log(f"Shape Driver v{NODE_VERSION} ready. Will do {CIRCLE_LAPS} circles then drive straight.")
+    for i in range(4):
+        # Move forward
+        move_cmd.linear.x = forward_speed
+        move_cmd.angular.z = 0.0
+        pub.publish(move_cmd)
+        time.sleep(forward_time)
 
-    def cb_command(self, msg):
-        cmd = msg.data.strip().lower()
-        if cmd in ["circle", "straight", "stop"]:
-            self.current_shape = cmd
-            self.log(f"Switching to: {cmd}")
-        else:
-            self.log(f"Unknown command: {cmd}")
+        # Stop briefly
+        move_cmd.linear.x = 0.0
+        pub.publish(move_cmd)
+        time.sleep(0.5)
 
-    def publish_cmd(self, v, omega):
-        msg = Twist2DStamped()
-        msg.header.stamp = rospy.Time.now()
-        msg.v = v
-        msg.omega = omega
-        self.pub_car_cmd.publish(msg)
+        # Turn 90 degrees
+        move_cmd.angular.z = turn_speed
+        pub.publish(move_cmd)
+        time.sleep(turn_time)
 
-    def drive_circles_then_straight(self):
-        self.log("Starting circles...")
-        for lap in range(CIRCLE_LAPS):
-            if self.current_shape != "circle":
-                return
-            self.log(f"Circle lap {lap + 1}/{CIRCLE_LAPS}")
-            t_end = rospy.Time.now() + rospy.Duration(CIRCLE_LAP_DURATION)
-            while rospy.Time.now() < t_end:
-                if self.current_shape != "circle":
-                    return
-                self.publish_cmd(0.2, 2.0)
-                rospy.sleep(0.1)
+        # Stop briefly again
+        move_cmd.angular.z = 0.0
+        pub.publish(move_cmd)
+        time.sleep(0.5)
 
-        self.log("Circles done. Driving straight.")
-        self.current_shape = "straight"
-
-    def run(self):
-        while not rospy.is_shutdown():
-            if self.current_shape == "circle":
-                self.drive_circles_then_straight()
-            elif self.current_shape == "straight":
-                self.publish_cmd(0.2, 0.0)
-                rospy.sleep(0.1)
-            else:
-                self.publish_cmd(0.0, 0.0)
-                rospy.sleep(0.1)
-
-    def on_shutdown(self):
-        self.publish_cmd(0.0, 0.0)
-        super(ShapeDriverNode, self).on_shutdown()
-
+    # Final stop
+    move_cmd.linear.x = 0.0
+    move_cmd.angular.z = 0.0
+    pub.publish(move_cmd)
 
 if __name__ == '__main__':
-    node = ShapeDriverNode(node_name='shape_driver_node')
-    node.run()
+    try:
+        move_square()
+    except rospy.ROSInterruptException:
+        pass
+
