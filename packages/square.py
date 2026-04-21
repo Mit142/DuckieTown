@@ -1,35 +1,37 @@
-#!/usr/bin/env python3
-
 import rospy
-from geometry_msgs.msg import Twist
+from duckietown_msgs.msg import Twist2DStamped
 import time
 
-# --- Configuration ---
-VEHICLE_NAME = "entebot208"
+VEHICLE_NAME  = "entebot208"
 
-# Forward speed (m/s) and duration (s)
-LINEAR_SPEED  = 0.3   # adjust to your surface/wheel calibration
-FORWARD_TIME  = 2.0   # seconds to drive one side of the square
+LINEAR_SPEED  = 0.3    # m/s
+FORWARD_TIME  = 2.0    # seconds per side
 
-# Turn speed (rad/s) and duration (s)
-# For a 90° turn: angular_speed × turn_time ≈ π/2 ≈ 1.5708 rad
-ANGULAR_SPEED = 0.785  # rad/s  (π/4)
-TURN_TIME     = 2.0    # seconds  → 0.785 × 2.0 ≈ 1.57 rad ≈ 90°
+ANGULAR_SPEED = 0.785  # rad/s (π/4)
+TURN_TIME     = 2.0    # seconds → ~90°
 
-PAUSE_TIME    = 0.5    # brief stop between moves
+PAUSE_TIME    = 0.5
+
+
+def stop(pub):
+    msg = Twist2DStamped()
+    msg.v     = 0.0
+    msg.omega = 0.0
+    pub.publish(msg)
+    rospy.sleep(PAUSE_TIME)
 
 
 def drive_square():
     rospy.init_node("drive_square_node", anonymous=True)
 
-    # Topic: /<vehicle>/car_node/cmd_vel  (adjust if your setup differs)
-    topic = f"/{VEHICLE_NAME}/car_node/cmd_vel"
-    pub   = rospy.Publisher(topic, Twist, queue_size=10)
+    # Correct Duckietown daffy topic
+    topic = f"/{VEHICLE_NAME}/kinematics_node/velocity"
+    pub   = rospy.Publisher(topic, Twist2DStamped, queue_size=10)
 
     rospy.loginfo(f"Publishing to: {topic}")
-    rospy.sleep(1.0)   # wait for publisher to register
+    rospy.sleep(1.0)
 
-    rate = rospy.Rate(10)  # 10 Hz
+    rate = rospy.Rate(10)
 
     for side in range(4):
         if rospy.is_shutdown():
@@ -37,33 +39,29 @@ def drive_square():
 
         # ── 1. Drive forward ──────────────────────────────
         rospy.loginfo(f"Side {side + 1}/4 — driving forward")
-        msg_forward        = Twist()
-        msg_forward.linear.x  = LINEAR_SPEED
-        msg_forward.angular.z = 0.0
+        msg            = Twist2DStamped()
+        msg.v          = LINEAR_SPEED
+        msg.omega      = 0.0
 
         t_start = time.time()
         while time.time() - t_start < FORWARD_TIME and not rospy.is_shutdown():
-            pub.publish(msg_forward)
+            pub.publish(msg)
             rate.sleep()
 
-        # ── 2. Stop ───────────────────────────────────────
-        pub.publish(Twist())   # all-zero Twist = stop
-        rospy.sleep(PAUSE_TIME)
+        stop(pub)
 
-        # ── 3. Turn 90° left ─────────────────────────────
+        # ── 2. Turn 90° ───────────────────────────────────
         rospy.loginfo(f"Side {side + 1}/4 — turning 90°")
-        msg_turn           = Twist()
-        msg_turn.linear.x  = 0.0
-        msg_turn.angular.z = ANGULAR_SPEED   # positive = left / CCW
+        msg            = Twist2DStamped()
+        msg.v          = 0.0
+        msg.omega      = ANGULAR_SPEED
 
         t_start = time.time()
         while time.time() - t_start < TURN_TIME and not rospy.is_shutdown():
-            pub.publish(msg_turn)
+            pub.publish(msg)
             rate.sleep()
 
-        # ── 4. Stop ───────────────────────────────────────
-        pub.publish(Twist())
-        rospy.sleep(PAUSE_TIME)
+        stop(pub)
 
     rospy.loginfo("Square complete!")
 
@@ -73,5 +71,4 @@ if __name__ == "__main__":
         drive_square()
     except rospy.ROSInterruptException:
         pass
-
 
