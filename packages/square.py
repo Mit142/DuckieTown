@@ -60,7 +60,7 @@ if __name__ == '__main__':
         time.sleep(1.0) 
         
         # Tell the robot to drive in a circle for exactly 16 seconds
-        node.drive_circle(duration_seconds=16.0)
+        node.drive_circle(duration_seconds=20.0)
         
     except rospy.ROSInterruptException:
         pass
