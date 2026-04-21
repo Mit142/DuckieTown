@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-NODE_VERSION = "2.1.0"
+NODE_VERSION = "2.2.0"
 import os
 import rospy
 from duckietown.dtros import DTROS, NodeType
@@ -10,7 +10,7 @@ SQUARE_SIDES     = 4
 FORWARD_SPEED    = 0.3    # m/s
 FORWARD_DURATION = 2.0    # seconds per side — tune this
 TURN_SPEED       = 1.5    # rad/s
-TURN_DURATION    = 1.1    # seconds → 1.5 × 1.1 ≈ 1.65 rad ≈ 94° (slightly over to compensate for lag)
+TURN_DURATION    = 1.1    # seconds → 1.5 × 1.1 ≈ 1.65 rad ≈ 94° (slightly over to comp for lag)
 STOP_DURATION    = 0.5    # pause between moves
 
 class ShapeDriverNode(DTROS):
@@ -27,8 +27,10 @@ class ShapeDriverNode(DTROS):
             String,
             self.cb_command
         )
-        self.current_shape = "square"
-        self.log(f"Shape Driver v{NODE_VERSION} ready.")
+        
+        # FIXED: Start in a safe state so the robot doesn't immediately drive off a table
+        self.current_shape = "stop" 
+        self.log(f"Shape Driver v{NODE_VERSION} ready. Waiting for 'square' command.")
 
     def cb_command(self, msg):
         cmd = msg.data.strip().lower()
@@ -41,18 +43,21 @@ class ShapeDriverNode(DTROS):
     def publish_cmd(self, v, omega):
         msg = Twist2DStamped()
         msg.header.stamp = rospy.Time.now()
+        # FIXED: Added frame_id to comply with ROS conventions and prevent downstream tf errors
+        msg.header.frame_id = f"{self.veh}/base_link" 
         msg.v     = v
         msg.omega = omega
         self.pub_car_cmd.publish(msg)
 
     def drive_timed(self, v, omega, duration):
-        """Publish at 20 Hz for the given duration, with fine-grained sleep."""
+        """Publish at 20 Hz for the given duration, checking for interrupts."""
         t_end = rospy.Time.now() + rospy.Duration(duration)
         while rospy.Time.now() < t_end:
-            if rospy.is_shutdown() or self.current_shape not in ["square"]:
+            # Check if we were told to stop mid-maneuver
+            if rospy.is_shutdown() or self.current_shape != "square":
                 return
             self.publish_cmd(v, omega)
-            rospy.sleep(0.05)   # 20 Hz — finer steps so short durations aren't skipped
+            rospy.sleep(0.05)   # 20 Hz
 
     def hard_stop(self):
         """Publish zero velocity multiple times to make sure it registers."""
@@ -71,23 +76,27 @@ class ShapeDriverNode(DTROS):
             self.log(f"Side {side + 1}/{SQUARE_SIDES} — driving forward {FORWARD_DURATION}s")
             self.drive_timed(FORWARD_SPEED, 0.0, FORWARD_DURATION)
 
-            # 2. Hard stop
+            # 2. Hard stop & Pause
+            # FIXED: Using drive_timed instead of rospy.sleep so the pause is interruptible
             self.hard_stop()
-            rospy.sleep(STOP_DURATION)
+            self.drive_timed(0.0, 0.0, STOP_DURATION) 
+
+            if self.current_shape != "square": return # Extra safety catch after pause
 
             # 3. Turn 90°
             self.log(f"Side {side + 1}/{SQUARE_SIDES} — turning 90°")
             self.drive_timed(0.0, TURN_SPEED, TURN_DURATION)
 
-            # 4. Hard stop
+            # 4. Hard stop & Pause
+            # FIXED: Interruptible pause
             self.hard_stop()
-            rospy.sleep(STOP_DURATION)
+            self.drive_timed(0.0, 0.0, STOP_DURATION)
 
         self.log("Square complete!")
         self.current_shape = "stop"
 
     def run(self):
-        rospy.sleep(1.0)  # wait for publisher to register before sending commands
+        rospy.sleep(1.0)  # wait for publisher to register
         while not rospy.is_shutdown():
             if self.current_shape == "square":
                 self.drive_square()
