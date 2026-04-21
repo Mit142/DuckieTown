@@ -32,7 +32,7 @@ class SquareDriverNode(DTROS):
         rospy.sleep(1.0) 
         
         rospy.loginfo("Starting square trajectory...")
-        for i in range(4):
+        for i in range(16):
             # 1. Drive forward
             rospy.loginfo(f"Side {i+1}: Driving straight...")
             self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
@@ -41,7 +41,7 @@ class SquareDriverNode(DTROS):
             # 2. Point Turn 90 degrees LEFT (Stronger & Sharper)
             # Both wheels help the turn, reducing motor strain.
             rospy.loginfo(f"Side {i+1}: Point turning left...")
-            self.send_cmd(vel_left=-0.5, vel_right=0.5, duration=0.45) 
+            self.send_cmd(vel_left=-0.45, vel_right=0.45, duration=0.45) 
             self.stop()
         
     def on_shutdown(self):
