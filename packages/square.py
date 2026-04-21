@@ -8,7 +8,8 @@ class SquareDriverNode(DTROS):
     def __init__(self, node_name):
         super(SquareDriverNode, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
         
-        self.veh = os.environ.get('entebot208', 'duckiebot')
+        # FIXED: Hardcoded your robot's exact name
+        self.veh = 'entebot208' 
         topic_name = f"/{self.veh}/wheels_driver_node/wheels_cmd"
         
         self.pub_cmd = rospy.Publisher(topic_name, WheelsCmdStamped, queue_size=1)
@@ -28,24 +29,25 @@ class SquareDriverNode(DTROS):
         """Halts the robot briefly to prevent drift before the next move."""
         self.send_cmd(vel_left=0.0, vel_right=0.0, duration=0.5)
 
+    # FIXED: Indented properly inside the class
     def execute_square(self):
         rospy.sleep(1.0) 
         
         rospy.loginfo("Starting square trajectory...")
-        # 1. Drive forward
-        self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
-        self.stop()
+        
+        # FIXED: The loop logic
         for i in range(4):
-            
-            # 2. Point Turn 90 degrees LEFT (Stronger & Sharper)
-            # Both wheels help the turn, reducing motor strain.
-            rospy.loginfo(f"Side {i+1}: Point turning left...")
-            self.send_cmd(vel_left=0, vel_right=1, duration=0.8) 
-            self.stop()
             # 1. Drive forward
             rospy.loginfo(f"Side {i+1}: Driving straight...")
             self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
             self.stop()
+            
+            # 2. Turn LEFT
+            rospy.loginfo(f"Side {i+1}: Turning left...")
+            self.send_cmd(vel_left=0.0, vel_right=1.0, duration=0.8) 
+            self.stop()
+            
+        rospy.loginfo("Square completed!")
         
     def on_shutdown(self):
         """Safety catch: Ensure wheels stop if the node is forcibly shut down."""
@@ -58,5 +60,4 @@ if __name__ == '__main__':
         node.execute_square()
     except rospy.ROSInterruptException:
         pass
-
 
