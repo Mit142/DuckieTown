@@ -41,7 +41,7 @@ class SquareDriverNode(DTROS):
             # 2. Point Turn 90 degrees LEFT (Stronger & Sharper)
             # Both wheels help the turn, reducing motor strain.
             rospy.loginfo(f"Side {i+1}: Point turning left...")
-            self.send_cmd(vel_left=-0.7, vel_right=0.7, duration=0.5) 
+            self.send_cmd(vel_left=-0.35, vel_right=0.35, duration=0.5) 
             self.stop()
         
     def on_shutdown(self):
