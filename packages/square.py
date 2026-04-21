@@ -1,83 +1,77 @@
+#!/usr/bin/env python3
+
 import rospy
 from geometry_msgs.msg import Twist
-import math
+import time
 
-def move_square():
-    # 1. Initialize the ROS node
-    rospy.init_node('duckiebot_square_node', anonymous=True)
+# --- Configuration ---
+VEHICLE_NAME = "entebot208"
 
-    # 2. Set up the Publisher
-    # IMPORTANT: Replace 'duckiebot_name' with your actual Duckiebot's hostname
-    vel_pub = rospy.Publisher('/duckiebot_name/cmd_vel', Twist, queue_size=10)
-    rate = rospy.Rate(10) # Publish at 10 Hz
+# Forward speed (m/s) and duration (s)
+LINEAR_SPEED  = 0.3   # adjust to your surface/wheel calibration
+FORWARD_TIME  = 2.0   # seconds to drive one side of the square
 
-    # 3. Define movement parameters
-    linear_speed = 0.2  # meters per second
-    angular_speed = 0.5 # radians per second
-    
-    # Time = Distance / Speed
-    side_duration = 3.0 # Drive straight for 3 seconds
-    
-    # 90 degrees in radians is pi/2. Time = (pi/2) / angular_speed
-    turn_duration = (math.pi / 2) / angular_speed
+# Turn speed (rad/s) and duration (s)
+# For a 90° turn: angular_speed × turn_time ≈ π/2 ≈ 1.5708 rad
+ANGULAR_SPEED = 0.785  # rad/s  (π/4)
+TURN_TIME     = 2.0    # seconds  → 0.785 × 2.0 ≈ 1.57 rad ≈ 90°
 
-    # Create empty Twist messages for movement and stopping
-    move_cmd = Twist()
-    move_cmd.linear.x = linear_speed
-    move_cmd.angular.z = 0.0
+PAUSE_TIME    = 0.5    # brief stop between moves
 
-    turn_cmd = Twist()
-    turn_cmd.linear.x = 0.0
-    turn_cmd.angular.z = angular_speed
 
-    stop_cmd = Twist() # Default is all zeros
+def drive_square():
+    rospy.init_node("drive_square_node", anonymous=True)
 
-    rospy.sleep(1) # Give the node a second to connect to the publisher
+    # Topic: /<vehicle>/car_node/cmd_vel  (adjust if your setup differs)
+    topic = f"/{VEHICLE_NAME}/car_node/cmd_vel"
+    pub   = rospy.Publisher(topic, Twist, queue_size=10)
 
-    # 4. Execute the square loop 4 times
-    for i in range(4):
-        rospy.loginfo(f"Moving straight: Side {i+1}")
-        start_time = rospy.Time.now().to_sec()
-        # Drive forward
-        while rospy.Time.now().to_sec() - start_time < side_duration:
-            vel_pub.publish(move_cmd)
+    rospy.loginfo(f"Publishing to: {topic}")
+    rospy.sleep(1.0)   # wait for publisher to register
+
+    rate = rospy.Rate(10)  # 10 Hz
+
+    for side in range(4):
+        if rospy.is_shutdown():
+            break
+
+        # ── 1. Drive forward ──────────────────────────────
+        rospy.loginfo(f"Side {side + 1}/4 — driving forward")
+        msg_forward        = Twist()
+        msg_forward.linear.x  = LINEAR_SPEED
+        msg_forward.angular.z = 0.0
+
+        t_start = time.time()
+        while time.time() - t_start < FORWARD_TIME and not rospy.is_shutdown():
+            pub.publish(msg_forward)
             rate.sleep()
 
-        # Brief stop to prevent drifting
-        vel_pub.publish(stop_cmd)
-        rospy.sleep(0.5)
+        # ── 2. Stop ───────────────────────────────────────
+        pub.publish(Twist())   # all-zero Twist = stop
+        rospy.sleep(PAUSE_TIME)
 
-        rospy.loginfo("Turning 90 degrees")
-        start_time = rospy.Time.now().to_sec()
-        # Turn
-        while rospy.Time.now().to_sec() - start_time < turn_duration:
-            vel_pub.publish(turn_cmd)
+        # ── 3. Turn 90° left ─────────────────────────────
+        rospy.loginfo(f"Side {side + 1}/4 — turning 90°")
+        msg_turn           = Twist()
+        msg_turn.linear.x  = 0.0
+        msg_turn.angular.z = ANGULAR_SPEED   # positive = left / CCW
+
+        t_start = time.time()
+        while time.time() - t_start < TURN_TIME and not rospy.is_shutdown():
+            pub.publish(msg_turn)
             rate.sleep()
 
-        # Brief stop before the next side
-        vel_pub.publish(stop_cmd)
-        rospy.sleep(0.5)
+        # ── 4. Stop ───────────────────────────────────────
+        pub.publish(Twist())
+        rospy.sleep(PAUSE_TIME)
 
-    # Final stop after the square is complete
-    vel_pub.publish(stop_cmd)
-    rospy.loginfo("Square completed!")
+    rospy.loginfo("Square complete!")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     try:
-        move_square()
+        drive_square()
     except rospy.ROSInterruptException:
         pass
-
-
-
-
-
-
-
-
-
-
-
-
 
 
