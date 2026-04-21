@@ -19,9 +19,15 @@ class SquareDriverNode(DTROS):
         msg = WheelsCmdStamped(vel_left=vel_left, vel_right=vel_right)
         
         rate = rospy.Rate(10)
-        start_time = rospy.get_time()
         
-        while not rospy.is_shutdown() and (rospy.get_time() - start_time) < duration:
+        # FIX 1: Use rospy.Time.now() and rospy.Duration for safer time math
+        end_time = rospy.Time.now() + rospy.Duration(duration)
+        
+        while rospy.Time.now() < end_time and not rospy.is_shutdown():
+            # FIX 2: You MUST update the header timestamp every single loop!
+            # Without this, the motor driver rejects your stop commands and spins forever.
+            msg.header.stamp = rospy.Time.now()
+            
             self.pub_cmd.publish(msg)
             rate.sleep()
             
@@ -48,16 +54,14 @@ class SquareDriverNode(DTROS):
             
         rospy.loginfo("Square completed!")
         
-        # --- NEW ADDITION: Final Straightaway ---
+        # --- Final Straightaway ---
         rospy.loginfo("Final move: Driving straight one last time...")
         self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
         
-        # --- NEW ADDITION: The "Anti-Spin" Stop ---
+        # --- The Anti-Spin Stop ---
         rospy.loginfo("Halting motors...")
         self.stop()
         
-        # This 1-second pause prevents the node from dying before the stop message 
-        # reaches the wheels. It cures the endless spinning!
         rospy.sleep(1.0) 
         rospy.loginfo("Program finished safely.")
         
@@ -72,5 +76,3 @@ if __name__ == '__main__':
         node.execute_square()
     except rospy.ROSInterruptException:
         pass
-
-
