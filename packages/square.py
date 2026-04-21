@@ -1,69 +1,85 @@
 #!/usr/bin/env python3
+
+# Update NODE_VERSION on every change (see CLAUDE.md § Versioning)
+NODE_VERSION = "1.3.0"
+
 import os
 import rospy
 from duckietown.dtros import DTROS, NodeType
-from duckietown_msgs.msg import WheelsCmdStamped
+from duckietown_msgs.msg import Twist2DStamped
+from std_msgs.msg import String
 
-class SquareDriverNode(DTROS):
+CIRCLE_LAPS = 2
+CIRCLE_LAP_DURATION = 8.0  # seconds per lap (tune to taste)
+
+
+class ShapeDriverNode(DTROS):
     def __init__(self, node_name):
-        super(SquareDriverNode, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
-        
-        self.veh = os.environ.get('VEHICLE_NAME', 'duckiebot')
-        topic_name = f"/{self.veh}/wheels_driver_node/wheels_cmd"
-        
-        self.pub_cmd = rospy.Publisher(topic_name, WheelsCmdStamped, queue_size=1)
+        super(ShapeDriverNode, self).__init__(node_name=node_name, node_type=NodeType.CONTROL)
+        self.veh = os.environ.get("VEHICLE_NAME", "entebot208")
 
-    def send_cmd(self, vel_left, vel_right, duration):
-        """Publishes raw wheel commands for a set duration."""
-        msg = WheelsCmdStamped(vel_left=vel_left, vel_right=vel_right)
-        rate = rospy.Rate(10)
-        start_time = rospy.get_time()
-        
-        while not rospy.is_shutdown() and (rospy.get_time() - start_time) < duration:
-            self.pub_cmd.publish(msg)
-            rate.sleep()
-            
-    def stop(self, duration=0.5):
-        """Halts the robot briefly to prevent drift."""
-        self.send_cmd(vel_left=0.0, vel_right=0.0, duration=duration)
+        self.pub_car_cmd = rospy.Publisher(
+            f"/{self.veh}/car_cmd_switch_node/cmd",
+            Twist2DStamped,
+            queue_size=1
+        )
+
+        rospy.Subscriber(
+            f"/{self.veh}/shape_driver_node/command",
+            String,
+            self.cb_command
+        )
+
+        self.current_shape = "circle"
+        self.log(f"Shape Driver v{NODE_VERSION} ready. Will do {CIRCLE_LAPS} circles then drive straight.")
+
+    def cb_command(self, msg):
+        cmd = msg.data.strip().lower()
+        if cmd in ["circle", "straight", "stop"]:
+            self.current_shape = cmd
+            self.log(f"Switching to: {cmd}")
+        else:
+            self.log(f"Unknown command: {cmd}")
+
+    def publish_cmd(self, v, omega):
+        msg = Twist2DStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.v = v
+        msg.omega = omega
+        self.pub_car_cmd.publish(msg)
+
+    def drive_circles_then_straight(self):
+        self.log("Starting circles...")
+        for lap in range(CIRCLE_LAPS):
+            if self.current_shape != "circle":
+                return
+            self.log(f"Circle lap {lap + 1}/{CIRCLE_LAPS}")
+            t_end = rospy.Time.now() + rospy.Duration(CIRCLE_LAP_DURATION)
+            while rospy.Time.now() < t_end:
+                if self.current_shape != "circle":
+                    return
+                self.publish_cmd(0.2, 2.0)
+                rospy.sleep(0.1)
+
+        self.log("Circles done. Driving straight.")
+        self.current_shape = "straight"
+
+    def run(self):
+        while not rospy.is_shutdown():
+            if self.current_shape == "circle":
+                self.drive_circles_then_straight()
+            elif self.current_shape == "straight":
+                self.publish_cmd(0.2, 0.0)
+                rospy.sleep(0.1)
+            else:
+                self.publish_cmd(0.0, 0.0)
+                rospy.sleep(0.1)
 
     def on_shutdown(self):
-        self.stop(duration=0.1)
+        self.publish_cmd(0.0, 0.0)
+        super(ShapeDriverNode, self).on_shutdown()
+
 
 if __name__ == '__main__':
-    node = SquareDriverNode(node_name="square_driver_node")
-    
-    try:
-        rospy.sleep(1.0)
-        rospy.loginfo("Starting square trajectory (Linear Mode)...")
-
-        # --- SIDE 1 ---
-        node.send_cmd(0.7, 0.7, 1.5) # Straight
-        node.stop()
-        node.send_cmd(-0.5, 0.5, 0.8) # Turn
-        node.stop()
-
-        # --- SIDE 2 ---
-        node.send_cmd(0.7, 0.7, 1.5) # Straight
-        node.stop()
-        node.send_cmd(-0.5, 0.5, 0.8) # Turn
-        node.stop()
-
-        # --- SIDE 3 ---
-        node.send_cmd(0.7, 0.7, 1.5) # Straight
-        node.stop()
-        node.send_cmd(-0.5, 0.5, 0.8) # Turn
-        node.stop()
-
-        # --- SIDE 4 ---
-        node.send_cmd(0.7, 0.7, 1.5) # Straight
-        node.stop()
-        node.send_cmd(-0.5, 0.5, 0.8) # Turn
-        
-        # FINAL SAFETY STOP
-        node.stop(duration=1.0)
-        rospy.loginfo("Square finished.")
-
-    except rospy.ROSInterruptException:
-        pass
-
+    node = ShapeDriverNode(node_name='shape_driver_node')
+    node.run()
