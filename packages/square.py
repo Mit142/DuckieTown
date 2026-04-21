@@ -26,15 +26,15 @@ class SquareDriverNode(DTROS):
             
     def stop(self):
         """Halts the robot briefly to prevent drift before the next move."""
-        self.send_cmd(vel_left=0.0, vel_right=0.0, duration=0.5)
+        self.send_cmd(vel_left=0.0, vel_right=0.0, duration=1.5)
 
 def execute_square(self):
         rospy.sleep(1.0) 
         
         rospy.loginfo("Starting square trajectory...")
 # 1. Drive forward
-            self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
-            self.stop()
+        self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
+        self.stop()
         for i in range(4):
             
             # 2. Point Turn 90 degrees LEFT (Stronger & Sharper)
