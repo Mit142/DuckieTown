@@ -1,54 +1,63 @@
 #!/usr/bin/env python3
+import os
 import rospy
 from duckietown.dtros import DTROS, NodeType
-from duckietown_msgs.msg import Twist2DStamped
+from duckietown_msgs.msg import WheelsCmdStamped
 
-class CircleDriverNode(DTROS):
+class SquareDriverNode(DTROS):
     def __init__(self, node_name):
-        super(CircleDriverNode, self).__init__(node_name=node_name, node_type=NodeType.CONTROL)
+        super(SquareDriverNode, self).__init__(node_name=node_name, node_type=NodeType.GENERIC)
         
-        self.veh = rospy.get_namespace().strip("/")
-        if not self.veh:
-            self.veh = "entebot208" 
-            
-        # Spoofing the joystick topic to bypass the FSM lock
-        topic_name = f"/{self.veh}/joy_mapper_node/car_cmd"
-        self.pub_cmd = rospy.Publisher(topic_name, Twist2DStamped, queue_size=10)
+        # FIXED: Hardcoded your robot's exact name
+        self.veh = 'entebot208' 
+        topic_name = f"/{self.veh}/wheels_driver_node/wheels_cmd"
+        
+        self.pub_cmd = rospy.Publisher(topic_name, WheelsCmdStamped, queue_size=1)
 
-    def send_cmd(self, v, omega, duration):
-        """Publishes a Twist2DStamped message for a set duration."""
-        msg = Twist2DStamped()
-        msg.v = v          # Linear velocity (m/s)
-        msg.omega = omega  # Angular velocity (rad/s)
+    def send_cmd(self, vel_left, vel_right, duration):
+        """Publishes raw wheel commands for a set duration."""
+        msg = WheelsCmdStamped(vel_left=vel_left, vel_right=vel_right)
         
-        rate = rospy.Rate(10) # 10 Hz publishing rate
-        end_time = rospy.Time.now() + rospy.Duration(duration)
+        rate = rospy.Rate(10)
+        start_time = rospy.get_time()
         
-        while rospy.Time.now() < end_time and not rospy.is_shutdown():
-            # Mandatory timestamp to pass the dead man's switch
-            msg.header.stamp = rospy.Time.now()
+        while not rospy.is_shutdown() and (rospy.get_time() - start_time) < duration:
             self.pub_cmd.publish(msg)
             rate.sleep()
             
     def stop(self):
-        """Halts the robot."""
-        self.send_cmd(0.0, 0.0, 0.5)
+        """Halts the robot briefly to prevent drift before the next move."""
+        self.send_cmd(vel_left=0.0, vel_right=0.0, duration=0.5)
 
-    def execute_circle(self):
-        # Wait a moment for publishers to establish a connection
+    # FIXED: Indented properly inside the class
+    def execute_square(self):
         rospy.sleep(1.0) 
         
-        rospy.loginfo("Starting circle trajectory...")
+        rospy.loginfo("Starting square trajectory...")
         
-        # Drive forward AND turn at the same time for 10 seconds
-        self.send_cmd(v=0.3, omega=0.6, duration=10.0) 
+        # FIXED: The loop logic
+        for i in range(4):
+            # 1. Drive forward
+            rospy.loginfo(f"Side {i+1}: Driving straight...")
+            self.send_cmd(vel_left=0.7, vel_right=0.7, duration=1.5)
+            self.stop()
+            
+            # 2. Turn LEFT
+            rospy.loginfo(f"Side {i+1}: Turning left...")
+            self.send_cmd(vel_left=0.0, vel_right=0.5, duration=0.8) 
+            self.stop()
+            
+        rospy.loginfo("Square completed!")
         
+    def on_shutdown(self):
+        """Safety catch: Ensure wheels stop if the node is forcibly shut down."""
+        rospy.loginfo("Shutting down... stopping motors.")
         self.stop()
-        rospy.loginfo("Circle completed.")
 
 if __name__ == '__main__':
-    node = CircleDriverNode(node_name="circle_driver_node")
+    node = SquareDriverNode(node_name="square_driver_node")
     try:
-        node.execute_circle()
+        node.execute_square()
     except rospy.ROSInterruptException:
         pass
+
