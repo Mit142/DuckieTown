@@ -11,7 +11,8 @@ source /opt/ros/noetic/setup.bash
 
 # NOTE: Use the variable DT_REPO_PATH to know the absolute path to your code
 # NOTE: Use `dt-exec COMMAND` to run the main process (blocking process)
-
+export ROS_MASTER_URI=http://entebot208.local:11311
+export ROS_IP=$(hostname -I | awk '{print $1}')
 # launching app
 dt-exec python3 $DT_REPO_PATH/packages/laneFollowing.py
 
