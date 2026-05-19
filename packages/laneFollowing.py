@@ -30,7 +30,6 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Twist
 from duckietown_msgs.msg import Twist2DStamped, LanePose
-import duckietown_utils as du
 
 
 class LaneFollowingNode:
