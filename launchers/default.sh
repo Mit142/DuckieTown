@@ -14,7 +14,13 @@ source /opt/ros/noetic/setup.bash
 export ROS_MASTER_URI=http://entebot208.local:11311
 export ROS_IP=$(hostname -I | awk '{print $1}')
 # launching app
-dt-exec python3 $DT_REPO_PATH/packages/laneFollowing.py
+dt-exec python3 $DT_REPO_PATH/packages/laneFollowing.py \
+    __name:=lane_following_node \
+    __ns:=/${VEHICLE_NAME} \
+    ~image/compressed:=/${VEHICLE_NAME}/camera_node/image/compressed \
+    ~lane_pose:=/${VEHICLE_NAME}/lane_filter_node/lane_pose \
+    ~car_cmd:=/${VEHICLE_NAME}/lane_following_node/car_cmd
+ 
 
 # ----------------------------------------------------------------------------
 # YOUR CODE ABOVE THIS LINE
