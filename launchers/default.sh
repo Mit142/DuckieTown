@@ -13,7 +13,7 @@ dt-launchfile-init
 # NOTE: Use `dt-exec COMMAND` to run the main process (blocking process)
 
 # launching app
-dt-exec python3 $DT_REPO_PATH/packages/move.py
+dt-exec python3 $DT_REPO_PATH/packages/laneFollowing.py
 
 # ----------------------------------------------------------------------------
 # YOUR CODE ABOVE THIS LINE
