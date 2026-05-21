@@ -28,8 +28,7 @@ import cv2
 import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import CompressedImage
-from geometry_msgs.msg import Twist
-from duckietown_msgs.msg import WheelsCmdStamped, LanePose
+from duckietown_msgs.msg import Twist2DStamped, LanePose
 
 class LaneFollowingNode:
     def __init__(self):
@@ -243,28 +242,22 @@ class LaneFollowingNode:
       if not self.active:
         self._send_stop()
         return
-  
+
       omega = self.k_d * d + self.k_theta * phi
       omega = float(np.clip(omega, -self.omega_max, self.omega_max))
       v     = self.v_bar * speed_scale
-  
-      # Convert v and omega to left/right wheel speeds
-      # Duckiebot wheel baseline = 0.1 m
-      baseline = 0.1
-      vel_right = v + 0.5 * omega * baseline
-      vel_left  = v - 0.5 * omega * baseline
-  
-      cmd = WheelsCmdStamped()
+
+      cmd = Twist2DStamped()
       cmd.header.stamp = rospy.Time.now()
-      cmd.vel_right = float(np.clip(vel_right, -1.0, 1.0))
-      cmd.vel_left  = float(np.clip(vel_left,  -1.0, 1.0))
+      cmd.v = v
+      cmd.omega = omega
       self.pub_car_cmd.publish(cmd)
   
     def _send_stop(self):
-      cmd = WheelsCmdStamped()
+      cmd = Twist2DStamped()
       cmd.header.stamp = rospy.Time.now()
-      cmd.vel_right = 0.0
-      cmd.vel_left  = 0.0
+      cmd.v = 0.0
+      cmd.omega = 0.0
       self.pub_car_cmd.publish(cmd)
     
     def on_shutdown(self):
