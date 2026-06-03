@@ -274,20 +274,19 @@ class LaneDebugViewer:
         ])
         return np.vstack([top_row, bottom_row])
 
-    def spin(self):
-        rate = rospy.Rate(self.display_rate)
-        while not rospy.is_shutdown():
-            if self.latest_matrix is not None:
-                msg = CompressedImage()
-                msg.header.stamp = rospy.Time.now()
-                msg.format = "jpeg"
-                msg.data = np.array(cv2.imencode('.jpg', self.latest_matrix)[1]).tobytes()
-                self.pub_debug.publish(msg)
-                
+def spin(self):
+    rate = rospy.Rate(self.display_rate)
+    while not rospy.is_shutdown():
+        if self.latest_matrix is not None:
             try:
-                rate.sleep()
-            except rospy.ROSInterruptException:
-                break
+                msg = self.bridge.cv2_to_compressed_imgmsg(self.latest_matrix, dst_format='jpg')
+                self.pub_debug.publish(msg)
+            except CvBridgeError as e:
+                rospy.logerr("[lane_debug_viewer] Failed to encode image: %s", e)
+        try:
+            rate.sleep()
+        except rospy.ROSInterruptException:
+            break
 
 
 def main():
