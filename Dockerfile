@@ -63,6 +63,11 @@ RUN dt-pip3-install "${REPO_PATH}/dependencies-py3.*"
 # copy the source code
 COPY ./packages "${REPO_PATH}/packages"
 
+#stuff for opencv
+RUN pip3 uninstall -y opencv-python-headless || true && \
+         pip3 install --no-cache-dir opencv-python
+
+
 # install launcher scripts
 COPY ./launchers/. "${LAUNCH_PATH}/"
 RUN dt-install-launchers "${LAUNCH_PATH}"
