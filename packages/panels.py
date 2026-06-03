@@ -197,4 +197,106 @@ class LaneDebugViewer:
         panel4 = roi.copy()
         y_top, y_bot = 0, rh - 1
         cv2.line(panel4,
-                 (self._x_at_y(self
+                 (self._x_at_y(self.yellow_line, y_top), y_top),
+                 (self._x_at_y(self.yellow_line, y_bot), y_bot),
+                 (0, 200, 200), 1)
+        cv2.line(panel4,
+                 (self._x_at_y(self.white_line, y_top), y_top),
+                 (self._x_at_y(self.white_line, y_bot), y_bot),
+                 (200, 200, 200), 1)
+
+        n_bands = 6
+        for i in range(n_bands):
+            y = int(rh * (i + 0.5) / n_bands)
+            xl = int(np.clip(self._x_at_y(self.yellow_line, y), 0, rw - 1))
+            xr = int(np.clip(self._x_at_y(self.white_line, y), 0, rw - 1))
+            cv2.line(panel4, (xl, y), (xr, y), (0, 255, 0), 1)
+            xc = (xl + xr) // 2
+            cv2.circle(panel4, (xc, y), 2, (0, 0, 255), -1)
+
+        for cen in yellow_centroids:
+            cv2.circle(panel4, cen, 3, (0, 255, 255), -1)
+        if white_centroid is not None:
+            cv2.circle(panel4, white_centroid, 3, (255, 255, 255), -1)
+
+        if not self.yellow_seen:
+            cv2.putText(panel4, "Y:last", (4, rh - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        if not self.white_seen:
+            cv2.putText(panel4, "W:last", (rw - 70, rh - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # PANEL 5 - Canny edges
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, self.canny_lo, self.canny_hi)
+        panel5 = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        panel5[yellow_mask > 0] = (0, 255, 255)
+        panel5[white_mask > 0] = (255, 255, 255)
+
+        # PANEL 6 - the steering indicator
+        look_y = int(rh * self.lookahead_ratio)
+        xl = self._x_at_y(self.yellow_line, look_y)
+        xr = self._x_at_y(self.white_line, look_y)
+        lane_center_x = (xl + xr) / 2.0
+
+        self.smooth_center_x = (self.ema_alpha * lane_center_x
+                                + (1.0 - self.ema_alpha) * self.smooth_center_x)
+        target_x = int(np.clip(self.smooth_center_x, 0, rw - 1))
+        error = target_x - img_center_x
+
+        panel6 = cv2.convertScaleAbs(roi, alpha=0.4)
+        bot_origin = (img_center_x, rh - 1)
+        cv2.line(panel6, (img_center_x, 0), (img_center_x, rh - 1), (255, 150, 0), 1)
+        cv2.arrowedLine(panel6, bot_origin, (target_x, look_y),
+                        (0, 0, 255), 2, tipLength=0.2)
+        cv2.circle(panel6, (target_x, look_y), 4, (0, 255, 0), -1)
+
+        if abs(error) < self.deadband:
+            direction = "STRAIGHT"
+        elif error > 0:
+            direction = "RIGHT"
+        else:
+            direction = "LEFT"
+        cv2.putText(panel6, "err {:+d}px {}".format(error, direction),
+                    (4, rh - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # Assemble Row Structures
+        top_row = np.hstack([
+            self._format_panel(panel1, "1 RAW + ROI"),
+            self._format_panel(panel2, "2 YELLOW mask"),
+            self._format_panel(panel3, "3 WHITE mask"),
+        ])
+        bottom_row = np.hstack([
+            self._format_panel(panel4, "4 LANE BED"),
+            self._format_panel(panel5, "5 EDGES + HSV"),
+            self._format_panel(panel6, "6 STEERING"),
+        ])
+        return np.vstack([top_row, bottom_row])
+
+    def spin(self):
+        rate = rospy.Rate(self.display_rate)
+        while not rospy.is_shutdown():
+            if self.latest_matrix is not None:
+                msg = CompressedImage()
+                msg.header.stamp = rospy.Time.now()
+                msg.format = "jpeg"
+                msg.data = np.array(cv2.imencode('.jpg', self.latest_matrix)[1]).tobytes()
+                self.pub_debug.publish(msg)
+                
+            try:
+                rate.sleep()
+            except rospy.ROSInterruptException:
+                break
+
+
+def main():
+    viewer = LaneDebugViewer()
+    try:
+        viewer.spin()
+    except rospy.ROSInterruptException:
+        pass
+
+
+if __name__ == "__main__":
+    main()
