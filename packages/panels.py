@@ -208,7 +208,23 @@ class LaneFollowerWithPanels(DTROS):
         look_y = int(rh * self.lookahead_ratio)
         xl = self._x_at_y(self.yellow_line, look_y)
         xr = self._x_at_y(self.white_line, look_y)
-        lane_center_x = (xl + xr) / 2.0
+
+        # ---- FIX: Single-Line Fallback Logic ----
+        # 160px is roughly half the lane width in your 320px wide ROI panel
+        lane_half_width = 160 
+
+        if yellow_seen and white_seen:
+            # Normal operation: both lines visible
+            lane_center_x = (xl + xr) / 2.0
+        elif white_seen:
+            # Lost the yellow line! Estimate center using only the white line
+            lane_center_x = xr - lane_half_width
+        elif yellow_seen:
+            # Lost the white line! Estimate center using only the yellow line
+            lane_center_x = xl + lane_half_width
+        else:
+            # Blind! Hold the last known smooth center to coast through
+            lane_center_x = self.smooth_center_x
 
         self.smooth_center_x = (self.ema_alpha * lane_center_x
                                 + (1.0 - self.ema_alpha) * self.smooth_center_x)
