@@ -43,7 +43,7 @@ from duckietown.dtros import DTROS, NodeType
 class LaneFollowerWithPanels(DTROS):
  
     WINDOW = "lane follow panels"
-    SHOW_WINDOW = True     # False -> headless (no X needed at all)
+    SHOW_WINDOW = False     # False -> headless (no X needed at all)
     DISPLAY_SCALE = 0.7    # shrink the window only; lower if it lags over X
 
     def __init__(self):
@@ -73,7 +73,7 @@ class LaneFollowerWithPanels(DTROS):
         self.ema_alpha = 0.4
 
         # ---- control / wheel-mixing (TUNE) ---------------------------------
-        self.base_speed = float(rospy.get_param("~base_speed", 0.3))
+        self.base_speed = float(rospy.get_param("~base_speed", 0.15))        
         self.kp = float(rospy.get_param("~kp", 0.40))
         self.ki = float(rospy.get_param("~ki", 0.0))
         self.kd = float(rospy.get_param("~kd", 0.05))
