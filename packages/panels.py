@@ -74,10 +74,10 @@ class LaneFollowerWithPanels(DTROS):
 
         # ---- control / wheel-mixing (TUNE) ---------------------------------
         self.base_speed = float(rospy.get_param("~base_speed", 0.15))        
-        self.kp = float(rospy.get_param("~kp", 0.40))
+        self.kp = 0.25         # Lower from 0.40 (stops aggressive over-correction)
+        self.turn_max = 0.20       
         self.ki = float(rospy.get_param("~ki", 0.0))
         self.kd = float(rospy.get_param("~kd", 0.05))
-        self.turn_max = float(rospy.get_param("~turn_max", 0.5))
         self.wheel_min = float(rospy.get_param("~wheel_min", -0.4))
         self.wheel_max = float(rospy.get_param("~wheel_max", 0.6))
         self.deadband_norm = float(rospy.get_param("~deadband_norm", 0.02))
