@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-lane_follow.py
-==============
-Duckiebot lane-following controller (ROS Noetic).
+panels.py  (LANE FOLLOWER + LIVE imshow PANELS, in one node)
+============================================================
+Drives the bot AND shows the 6-panel debug view in an OpenCV window, in ONE
+node, so the panels always match what is actually driving.
 
-WHAT IT DOES, in one sentence:
-  Look at the camera -> find the yellow (left) and white (right) lane lines ->
-  work out how far off-centre the bot is -> turn that error into a steering
-  command -> publish wheel commands so the bot stays in the lane.
+  * DRIVES: publishes WheelsCmdStamped (vel_left, vel_right) to
+    /<veh>/wheels_driver_node/wheels_cmd.
+  * SHOWS: cv2.imshow window of the 2x3 panel matrix. Panel 6 prints the live
+    error AND the L/R wheel commands, so you see the calculation drive the bot.
 
-=============================================================================
- IF IT IS "NOT DRIVING AT ALL", it is almost always ONE of these three.
- Each is marked in the code below with a  >>> NOT DRIVING #n <<<  comment.
+DISPLAY / X11 (runtime, NOT in this code):
+  The window appears wherever DISPLAY points. You set that in your run command
+  (XLaunch + DISPLAY=<laptop_ip>:0.0). This file does not hardcode any of that.
 
-   #1  Commands are published but IGNORED downstream.
-       -> the car-command switch is in manual/joystick mode, or the cmd topic
-          is wrong for your distro. (Test A: manually `rostopic pub` a command.)
+  >>> CRASH-PROOF <<<  If the X11 connection drops (common with a networked X
+  server), imshow would normally SEGFAULT and kill the driver mid-drive. Here
+  every GUI call is guarded: a dead display just disables the window and the
+  bot KEEPS DRIVING. Set SHOW_WINDOW=False to run fully headless.
 
-   #2  The node publishes v=0 because it thinks the LANE IS LOST.
-       -> detection found no lines for > lost_timeout seconds, so it stops on
-          purpose. Usually HSV thresholds vs lighting. (Test B: `rostopic echo`
-          the cmd topic -> you'll see v: 0.0 constantly.)
+  >>> MESSAGE TYPE <<<  Publishes WheelsCmdStamped. If
+  `rostopic info /<veh>/wheels_driver_node/wheels_cmd` shows a different type,
+  change the import + publish_wheels().
+  >>> LAUNCHER <<<  Only THIS node should publish wheel commands. If
+  laneFollowing.py also drives, disable it or they will fight.
 
-   #3  The node never publishes anything because NO CAMERA FRAMES arrive.
-       -> self.latest stays None, the loop never reaches publish_cmd().
-          (Check VEHICLE_NAME, and `rostopic hz` on the camera topic.)
-=============================================================================
+SAFETY: wheels zeroed on shutdown and whenever the lane is lost. Test on
+blocks; check steering direction (steer_sign) before the floor.
 """
 
 import os
@@ -36,100 +37,93 @@ import numpy as np
 import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import CompressedImage
-from duckietown_msgs.msg import Twist2DStamped   # v (forward) + omega (turn)
+from duckietown_msgs.msg import WheelsCmdStamped
 
 
-class LaneFollower:
+class LaneFollowerWithPanels:
 
-    WINDOW = "lane follow (debug)"
-    SHOW_DEBUG = True          # set False to run headless / no -X needed
-    DEBUG_SCALE = 0.6          # debug window size only; no effect on control
+    WINDOW = "lane follow panels"
+    SHOW_WINDOW = True     # False -> headless (no X needed at all)
+    DISPLAY_SCALE = 0.7    # shrink the window only; lower if it lags over X
 
     def __init__(self):
-        rospy.init_node("lane_follow", anonymous=False)
+        rospy.init_node("lane_follow_panels", anonymous=False)
 
-        # Vehicle name -> used to build the namespaced topic names below.
         self.veh = os.environ.get("VEHICLE_NAME", "entebot208")
 
-        # ---- geometry (MUST match panels.py so your tuning carries over) ---
-        self.WORK_W, self.WORK_H = 640, 480      # resize every frame to this
-        self.roi_top_ratio = float(rospy.get_param("~roi_top_ratio", 0.5))    # ignore top 50%
-        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.35))  # row we aim at
+        # ---- geometry ------------------------------------------------------
+        self.WORK_W, self.WORK_H = 640, 480
+        self.PANEL_W, self.PANEL_H = 320, 240
+        self.roi_top_ratio = float(rospy.get_param("~roi_top_ratio", 0.5))
+        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.35))
 
-        # ---- HSV colour thresholds (copied from your pipeline) -------------
-        # If detection fails in your lighting, THESE are what to retune.
+        # ---- HSV thresholds ------------------------------------------------
         self.yellow_lo = np.array([20, 70, 100], dtype=np.uint8)
         self.yellow_hi = np.array([35, 255, 255], dtype=np.uint8)
         self.white_lo = np.array([0, 0, 180], dtype=np.uint8)
         self.white_hi = np.array([179, 55, 255], dtype=np.uint8)
-        self.min_yellow_area = 30     # ignore yellow blobs smaller than this
-        self.min_white_area = 150     # ignore white blobs smaller than this
+        self.min_yellow_area = 30
+        self.min_white_area = 150
+        self.canny_lo, self.canny_hi = 60, 160
         self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        self.ema_alpha = 0.4          # smoothing: higher = snappier, jumpier
+        self.deadband_px = 8
+        self.ema_alpha = 0.4
 
-        # ---- control parameters (THESE are what you tune for driving) ------
-        self.v_nominal = float(rospy.get_param("~v_nominal", 0.22))   # forward speed, m/s
-        self.kp = float(rospy.get_param("~kp", 2.5))   # P: how hard it corrects
-        self.ki = float(rospy.get_param("~ki", 0.0))   # I: fixes steady drift (leave 0 first)
-        self.kd = float(rospy.get_param("~kd", 0.10))  # D: damps wobble/oscillation
-        self.omega_max = float(rospy.get_param("~omega_max", 4.0))    # max turn rate, rad/s
-        self.deadband_norm = float(rospy.get_param("~deadband_norm", 0.02))  # ignore tiny error
-        self.control_rate = float(rospy.get_param("~control_rate", 15.0))    # loop Hz
-        self.lost_timeout = float(rospy.get_param("~lost_timeout", 1.0))     # s before STOP
-        # Set to -1.0 if the bot steers the WRONG way (turns toward the line
-        # it should move away from). Don't touch the math -- just flip this.
-        self.steer_sign = float(rospy.get_param("~steer_sign", 1.0))
+        # ---- control / wheel-mixing (TUNE) ---------------------------------
+        self.base_speed = float(rospy.get_param("~base_speed", 0.3))
+        self.kp = float(rospy.get_param("~kp", 0.40))
+        self.ki = float(rospy.get_param("~ki", 0.0))
+        self.kd = float(rospy.get_param("~kd", 0.05))
+        self.turn_max = float(rospy.get_param("~turn_max", 0.5))
+        self.wheel_min = float(rospy.get_param("~wheel_min", -0.4))
+        self.wheel_max = float(rospy.get_param("~wheel_max", 0.6))
+        self.deadband_norm = float(rospy.get_param("~deadband_norm", 0.02))
+        self.control_rate = float(rospy.get_param("~control_rate", 15.0))   # Hz
+        self.panel_rate = float(rospy.get_param("~panel_rate", 8.0))        # Hz
+        self.lost_timeout = float(rospy.get_param("~lost_timeout", 1.0))
+        self.steer_sign = float(rospy.get_param("~steer_sign", 1.0))  # flip -1.0 if wrong way
 
-        # ---- state kept between frames -------------------------------------
-        self.yellow_line = None        # last good [vx, vy, x0, y0] fit
+        # ---- state ---------------------------------------------------------
+        self.yellow_line = None
         self.white_line = None
-        self.smooth_center_x = None    # EMA-smoothed lane centre
-        self.err_norm = 0.0            # latest error, normalised to ~[-1, 1]
-        self.err_prev = 0.0            # previous error (for the D term)
-        self.err_integral = 0.0        # running sum (for the I term)
-        self.last_seen_time = rospy.Time.now()   # last time we saw ANY line
-        self.latest = None             # newest raw frame from the camera
-        self._debug_ok = self.SHOW_DEBUG
+        self.smooth_center_x = None
+        self.err_prev = 0.0
+        self.err_integral = 0.0
+        self.last_seen_time = rospy.Time.now()
+        self.latest = None
+        self._last_panel_t = 0.0
+        self._display_ok = self.SHOW_WINDOW
 
         # ---- ROS plumbing --------------------------------------------------
         self.bridge = CvBridge()
         self.cam_topic = "/{}/camera_node/image/compressed".format(self.veh)
+        self.wheels_topic = rospy.get_param(
+            "~wheels_topic", "/{}/wheels_driver_node/wheels_cmd".format(self.veh))
 
-        # >>> NOT DRIVING #1 <<<  This is the topic the wheel commands go to.
-        # If the bot won't move even though this node publishes nonzero v,
-        # the problem is almost certainly HERE (wrong topic or switch in
-        # manual mode). Verify the real topic with:  rostopic list | grep cmd
-        # and override without editing code:  rosrun ... _car_cmd_topic:=/...
-        self.cmd_topic = rospy.get_param(
-            "~car_cmd_topic", "/{}/car_cmd_switch_node/cmd".format(self.veh))
-
-        # Subscriber: small buff_size so ROS drops stale frames (low latency).
         self.sub = rospy.Subscriber(
             self.cam_topic, CompressedImage, self.image_callback,
             queue_size=1, buff_size=2 ** 22)
-        # Publisher: this is what actually drives the wheels.
-        self.pub_cmd = rospy.Publisher(self.cmd_topic, Twist2DStamped, queue_size=1)
+        self.pub_wheels = rospy.Publisher(self.wheels_topic, WheelsCmdStamped, queue_size=1)
 
-        # SAFETY: whenever this node exits, send zero so the bot halts.
         rospy.on_shutdown(self.stop)
 
         rospy.loginfo("[lane_follow] vehicle = %s", self.veh)
-        rospy.loginfo("[lane_follow] camera   = %s", self.cam_topic)
-        rospy.loginfo("[lane_follow] commands = %s", self.cmd_topic)
-        rospy.loginfo("[lane_follow] v=%.2f kp=%.2f ki=%.2f kd=%.2f",
-                      self.v_nominal, self.kp, self.ki, self.kd)
+        rospy.loginfo("[lane_follow] camera  = %s", self.cam_topic)
+        rospy.loginfo("[lane_follow] wheels  = %s", self.wheels_topic)
+        rospy.loginfo("[lane_follow] window  = %s (DISPLAY=%s)",
+                      self.SHOW_WINDOW, os.environ.get("DISPLAY", "<unset>"))
+        rospy.loginfo("[lane_follow] base=%.2f kp=%.2f kd=%.2f",
+                      self.base_speed, self.kp, self.kd)
 
     # ----------------------------------------------------------------------- #
-    #  CV helpers (identical to panels.py)
+    #  CV helpers
     # ----------------------------------------------------------------------- #
     @staticmethod
     def _find_contours(mask):
-        # [-2] makes this work on both OpenCV 3 and 4 (their return tuples differ).
         return cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
 
     @staticmethod
     def _centroid(contour):
-        # Centre of mass of a blob; None if the blob has zero area.
         m = cv2.moments(contour)
         if m["m00"] == 0:
             return None
@@ -137,21 +131,27 @@ class LaneFollower:
 
     @staticmethod
     def _x_at_y(line, y):
-        # Given a fitted line and a row y, return the x where the line sits.
         vx, vy, x0, y0 = line
-        if abs(vy) < 1e-6:          # near-horizontal guard (avoid divide-by-0)
+        if abs(vy) < 1e-6:
             return int(x0)
         return int(x0 + (float(y) - float(y0)) * (vx / vy))
 
     def _clean_mask(self, mask):
-        # Open removes specks, close fills small gaps -> cleaner blobs.
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
         return mask
 
+    def _format_panel(self, img, label):
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        img = cv2.resize(img, (self.PANEL_W, self.PANEL_H))
+        cv2.rectangle(img, (0, 0), (self.PANEL_W, 18), (0, 0, 0), -1)
+        cv2.putText(img, label, (4, 13), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        return img
+
     # ----------------------------------------------------------------------- #
-    #  Camera callback: keep it CHEAP -- just decode and store newest frame.
-    #  (All heavy work happens in the control loop so frames don't queue up.)
+    #  Camera callback
     # ----------------------------------------------------------------------- #
     def image_callback(self, msg):
         try:
@@ -162,19 +162,15 @@ class LaneFollower:
         self.latest = cv2.resize(frame, (self.WORK_W, self.WORK_H))
 
     # ----------------------------------------------------------------------- #
-    #  Vision: turn one frame into a single number -- the normalised error.
-    #  +error => lane centre is to the RIGHT of the bot (bot drifted left).
+    #  Vision: compute once, used by BOTH control and panels.
     # ----------------------------------------------------------------------- #
-    def compute_error(self, frame):
+    def compute_vision(self, frame):
         h, w = frame.shape[:2]
-
-        # Crop to the lower part of the image (the road just ahead).
         roi_y1 = int(h * self.roi_top_ratio)
-        roi = frame[roi_y1:h, 0:w]
+        roi = frame[roi_y1:h, 0:w].copy()
         rh, rw = roi.shape[:2]
-        img_center_x = rw // 2          # where the bot itself is pointing
+        img_center_x = rw // 2
 
-        # First-frame defaults so the line projections never crash.
         if self.yellow_line is None:
             self.yellow_line = np.array([0.0, 1.0, rw * 0.25, rh * 0.5], dtype=np.float32)
         if self.white_line is None:
@@ -182,155 +178,212 @@ class LaneFollower:
         if self.smooth_center_x is None:
             self.smooth_center_x = float(img_center_x)
 
-        # Colour-segment the ROI into yellow and white masks.
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         yellow_mask = self._clean_mask(cv2.inRange(hsv, self.yellow_lo, self.yellow_hi))
         white_mask = self._clean_mask(cv2.inRange(hsv, self.white_lo, self.white_hi))
 
-        # LEFT lane = yellow dashes: collect blob centroids and fit a line.
         yellow_centroids = []
         for c in self._find_contours(yellow_mask):
             if cv2.contourArea(c) >= self.min_yellow_area:
                 cen = self._centroid(c)
                 if cen is not None:
                     yellow_centroids.append(cen)
-        yellow_seen = len(yellow_centroids) >= 2     # need >=2 dashes to fit
+        yellow_seen = len(yellow_centroids) >= 2
         if yellow_seen:
             pts = np.array(yellow_centroids, dtype=np.float32)
             self.yellow_line = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
 
-        # RIGHT lane = solid white: fit a line through the largest white blob.
+        white_centroid = None
         white_contours = [c for c in self._find_contours(white_mask)
                           if cv2.contourArea(c) >= self.min_white_area]
         white_seen = len(white_contours) > 0
         if white_seen:
             largest = max(white_contours, key=cv2.contourArea)
             self.white_line = cv2.fitLine(largest, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+            white_centroid = self._centroid(largest)
 
-        # Lane centre = midpoint of the two lines at the lookahead row.
         look_y = int(rh * self.lookahead_ratio)
         xl = self._x_at_y(self.yellow_line, look_y)
         xr = self._x_at_y(self.white_line, look_y)
         lane_center_x = (xl + xr) / 2.0
 
-        # Smooth it so the steering doesn't jitter frame-to-frame.
         self.smooth_center_x = (self.ema_alpha * lane_center_x
                                 + (1.0 - self.ema_alpha) * self.smooth_center_x)
-        target_x = float(np.clip(self.smooth_center_x, 0, rw - 1))
+        target_x = int(np.clip(self.smooth_center_x, 0, rw - 1))
+        err_px = target_x - img_center_x
+        err_norm = err_px / float(img_center_x)
 
-        # Normalise: divide pixel offset by half-width -> roughly [-1, 1].
-        err_norm = (target_x - img_center_x) / float(img_center_x)
-
-        # >>> NOT DRIVING #2 <<<  We only refresh "last seen" if we actually
-        # detected a line this frame. If detection keeps failing, this stops
-        # updating, the lost-lane check below fires, and the bot is commanded
-        # to STOP. If `rostopic echo` shows v: 0.0 forever, look HERE: your
-        # masks aren't finding the lines (retune the HSV thresholds above).
         if yellow_seen or white_seen:
             self.last_seen_time = rospy.Time.now()
 
-        return err_norm, roi, look_y, int(target_x), img_center_x
+        return {
+            "frame": frame, "roi": roi, "roi_y1": roi_y1, "rh": rh, "rw": rw,
+            "w": w, "img_center_x": img_center_x,
+            "yellow_mask": yellow_mask, "white_mask": white_mask,
+            "yellow_centroids": yellow_centroids, "white_centroid": white_centroid,
+            "yellow_seen": yellow_seen, "white_seen": white_seen,
+            "look_y": look_y, "target_x": target_x,
+            "err_px": err_px, "err_norm": err_norm,
+        }
 
     # ----------------------------------------------------------------------- #
-    #  Optional debug window (lane lines + steering arrow + v/omega readout).
-    #  Returns True if the user pressed 'q'. Auto-disables if there's no display.
+    #  Build the 2x3 matrix (precomputed vision + live wheel cmds).
     # ----------------------------------------------------------------------- #
-    def show_debug(self, roi, look_y, target_x, img_center_x, v, omega):
-        if not self._debug_ok:
-            return False
-        rh, rw = roi.shape[:2]
-        dbg = roi.copy()
-        cv2.line(dbg, (self._x_at_y(self.yellow_line, 0), 0),
+    def build_panels(self, v, vel_left, vel_right):
+        frame = v["frame"]; roi = v["roi"]; rh = v["rh"]; rw = v["rw"]; w = v["w"]
+        roi_y1 = v["roi_y1"]; img_center_x = v["img_center_x"]
+        look_y = v["look_y"]; target_x = v["target_x"]; err_px = v["err_px"]
+
+        panel1 = frame.copy()
+        cv2.rectangle(panel1, (0, roi_y1), (w - 1, frame.shape[0] - 1), (0, 255, 0), 2)
+
+        panel2 = v["yellow_mask"]
+        panel3 = v["white_mask"]
+
+        panel4 = roi.copy()
+        cv2.line(panel4, (self._x_at_y(self.yellow_line, 0), 0),
                  (self._x_at_y(self.yellow_line, rh - 1), rh - 1), (0, 200, 200), 1)
-        cv2.line(dbg, (self._x_at_y(self.white_line, 0), 0),
+        cv2.line(panel4, (self._x_at_y(self.white_line, 0), 0),
                  (self._x_at_y(self.white_line, rh - 1), rh - 1), (200, 200, 200), 1)
-        cv2.line(dbg, (img_center_x, 0), (img_center_x, rh - 1), (255, 150, 0), 1)
-        cv2.arrowedLine(dbg, (img_center_x, rh - 1), (target_x, look_y),
+        for i in range(6):
+            y = int(rh * (i + 0.5) / 6)
+            xl = int(np.clip(self._x_at_y(self.yellow_line, y), 0, rw - 1))
+            xr = int(np.clip(self._x_at_y(self.white_line, y), 0, rw - 1))
+            cv2.line(panel4, (xl, y), (xr, y), (0, 255, 0), 1)
+            cv2.circle(panel4, ((xl + xr) // 2, y), 2, (0, 0, 255), -1)
+        for cen in v["yellow_centroids"]:
+            cv2.circle(panel4, cen, 3, (0, 255, 255), -1)
+        if v["white_centroid"] is not None:
+            cv2.circle(panel4, v["white_centroid"], 3, (255, 255, 255), -1)
+        if not v["yellow_seen"]:
+            cv2.putText(panel4, "Y:last", (4, rh - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        if not v["white_seen"]:
+            cv2.putText(panel4, "W:last", (rw - 70, rh - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, self.canny_lo, self.canny_hi)
+        panel5 = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+        panel5[v["yellow_mask"] > 0] = (0, 255, 255)
+        panel5[v["white_mask"] > 0] = (255, 255, 255)
+
+        panel6 = cv2.convertScaleAbs(roi, alpha=0.4)
+        cv2.line(panel6, (img_center_x, 0), (img_center_x, rh - 1), (255, 150, 0), 1)
+        cv2.arrowedLine(panel6, (img_center_x, rh - 1), (target_x, look_y),
                         (0, 0, 255), 2, tipLength=0.2)
-        cv2.putText(dbg, "v={:.2f} w={:+.2f}".format(v, omega),
-                    (4, rh - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        if self.DEBUG_SCALE != 1.0:
-            dbg = cv2.resize(dbg, None, fx=self.DEBUG_SCALE, fy=self.DEBUG_SCALE,
-                             interpolation=cv2.INTER_NEAREST)
+        cv2.circle(panel6, (target_x, look_y), 4, (0, 255, 0), -1)
+        if abs(err_px) < self.deadband_px:
+            direction = "STRAIGHT"
+        elif err_px > 0:
+            direction = "RIGHT"
+        else:
+            direction = "LEFT"
+        cv2.putText(panel6, "err {:+d}px {}".format(err_px, direction),
+                    (4, rh - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(panel6, "L={:+.2f}  R={:+.2f}".format(vel_left, vel_right),
+                    (4, rh - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        top = np.hstack([self._format_panel(panel1, "1 RAW + ROI"),
+                         self._format_panel(panel2, "2 YELLOW mask"),
+                         self._format_panel(panel3, "3 WHITE mask")])
+        bot = np.hstack([self._format_panel(panel4, "4 LANE BED"),
+                         self._format_panel(panel5, "5 EDGES + HSV"),
+                         self._format_panel(panel6, "6 STEERING + WHEELS")])
+        return np.vstack([top, bot])
+
+    # ----------------------------------------------------------------------- #
+    #  Crash-proof display: a dead X11 connection disables the window only.
+    # ----------------------------------------------------------------------- #
+    def _safe_show(self, matrix):
+        if not self._display_ok:
+            return
         try:
-            cv2.imshow(self.WINDOW, dbg)
+            if self.DISPLAY_SCALE != 1.0:
+                matrix = cv2.resize(matrix, None,
+                                    fx=self.DISPLAY_SCALE, fy=self.DISPLAY_SCALE,
+                                    interpolation=cv2.INTER_NEAREST)
+            cv2.imshow(self.WINDOW, matrix)
+        except cv2.error as exc:
+            rospy.logwarn("[lane_follow] display lost, window off (still driving): %s", exc)
+            self._display_ok = False
+
+    def _safe_waitkey(self):
+        if not self._display_ok:
+            return False
+        try:
             return (cv2.waitKey(1) & 0xFF) == ord('q')
         except cv2.error:
-            rospy.logwarn("[lane_follow] no display; disabling debug window")
-            self._debug_ok = False
+            self._display_ok = False
         return False
 
     # ----------------------------------------------------------------------- #
-    #  Control loop: runs at control_rate Hz, always on the newest frame.
+    #  Control + display loop
     # ----------------------------------------------------------------------- #
     def run(self):
-        if self._debug_ok:
-            cv2.namedWindow(self.WINDOW, cv2.WINDOW_NORMAL)
+        if self._display_ok:
+            try:
+                cv2.namedWindow(self.WINDOW, cv2.WINDOW_NORMAL)
+            except cv2.error as exc:
+                rospy.logwarn("[lane_follow] cannot open window (%s); headless", exc)
+                self._display_ok = False
+
         rate = rospy.Rate(self.control_rate)
-        dt = 1.0 / self.control_rate     # time per loop, for the I and D terms
+        dt = 1.0 / self.control_rate
+        panel_period = 0.0 if self.panel_rate <= 0 else 1.0 / self.panel_rate
 
         while not rospy.is_shutdown():
             frame = self.latest
-
-            # >>> NOT DRIVING #3 <<<  If no camera frame has arrived yet,
-            # we loop here forever and NEVER publish. If the bot is silent
-            # (rostopic echo shows nothing), the camera topic isn't reaching
-            # us -> check VEHICLE_NAME and `rostopic hz` on the camera.
             if frame is None:
                 rate.sleep()
                 continue
 
-            # Vision -> single error number.
-            err_norm, roi, look_y, target_x, img_center_x = self.compute_error(frame)
+            vis = self.compute_vision(frame)
 
-            # Lost-lane safety: if we haven't seen a line in a while, STOP.
+            # ---- control ----
             since_seen = (rospy.Time.now() - self.last_seen_time).to_sec()
             if since_seen > self.lost_timeout:
-                self.publish_cmd(0.0, 0.0)      # halt
-                self.err_integral = 0.0         # reset I so it doesn't wind up
-                if self.show_debug(roi, look_y, target_x, img_center_x, 0.0, 0.0):
-                    break
-                rate.sleep()
-                continue
+                vel_left = vel_right = 0.0
+                self.err_integral = 0.0
+            else:
+                e = vis["err_norm"]
+                if abs(e) < self.deadband_norm:
+                    e = 0.0
+                self.err_integral = float(np.clip(self.err_integral + e * dt, -1.0, 1.0))
+                de = (e - self.err_prev) / dt
+                self.err_prev = e
+                control = self.kp * e + self.ki * self.err_integral + self.kd * de
+                turn = float(np.clip(self.steer_sign * control, -self.turn_max, self.turn_max))
+                base = self.base_speed * (1.0 - 0.5 * min(abs(e), 1.0))
+                vel_left = float(np.clip(base + turn, self.wheel_min, self.wheel_max))
+                vel_right = float(np.clip(base - turn, self.wheel_min, self.wheel_max))
 
-            # Ignore tiny errors so the bot doesn't twitch when basically centred.
-            e = err_norm
-            if abs(e) < self.deadband_norm:
-                e = 0.0
+            self.publish_wheels(vel_left, vel_right)
 
-            # ---- PID controller -------------------------------------------
-            self.err_integral = float(np.clip(self.err_integral + e * dt, -1.0, 1.0))
-            de = (e - self.err_prev) / dt      # rate of change of the error
-            self.err_prev = e
-            control = self.kp * e + self.ki * self.err_integral + self.kd * de
-
-            # Sign: +e (lane to the right) -> we must turn RIGHT -> omega < 0.
-            # steer_sign flips everything at once if it's backwards.
-            omega = float(np.clip(-self.steer_sign * control,
-                                  -self.omega_max, self.omega_max))
-
-            # Slow down in sharp turns (big error) for stability.
-            v = self.v_nominal * (1.0 - 0.6 * min(abs(e), 1.0))
-
-            # This is the line that actually moves the bot.
-            self.publish_cmd(v, omega)
-
-            if self.show_debug(roi, look_y, target_x, img_center_x, v, omega):
+            # ---- panels (rate-limited; never blocks driving) ----
+            now = rospy.get_time()
+            if self._display_ok and (panel_period <= 0.0 or (now - self._last_panel_t) >= panel_period):
+                try:
+                    matrix = self.build_panels(vis, vel_left, vel_right)
+                    self._safe_show(matrix)
+                    self._last_panel_t = now
+                except Exception as exc:
+                    rospy.logwarn_throttle(2.0, "[lane_follow] panel error: %s" % exc)
+            if self._safe_waitkey():
                 break
+
             rate.sleep()
 
-    def publish_cmd(self, v, omega):
-        # Build and send a Twist2DStamped: v = forward m/s, omega = turn rad/s.
-        msg = Twist2DStamped()
+    def publish_wheels(self, vel_left, vel_right):
+        msg = WheelsCmdStamped()
         msg.header.stamp = rospy.Time.now()
-        msg.v = float(v)
-        msg.omega = float(omega)
-        self.pub_cmd.publish(msg)
+        msg.vel_left = float(vel_left)
+        msg.vel_right = float(vel_right)
+        self.pub_wheels.publish(msg)
 
     def stop(self):
-        # Send several zeros so the halt definitely lands, then clean up.
         for _ in range(10):
-            self.publish_cmd(0.0, 0.0)
+            self.publish_wheels(0.0, 0.0)
             rospy.sleep(0.02)
         try:
             cv2.destroyAllWindows()
@@ -340,16 +393,15 @@ class LaneFollower:
 
 
 def main():
-    node = LaneFollower()
+    node = LaneFollowerWithPanels()
     try:
         node.run()
     except rospy.ROSInterruptException:
         pass
     finally:
-        node.stop()      # belt-and-suspenders: stop on any exit path
+        node.stop()
 
 
 if __name__ == "__main__":
     main()
-
 
