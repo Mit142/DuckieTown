@@ -14,7 +14,7 @@ source /opt/ros/noetic/setup.bash
 export ROS_MASTER_URI=http://entebot208.local:11311
 export ROS_IP=$(hostname -I | awk '{print $1}')
 # launching app
-python3 $DT_REPO_PATH/packages/panels.py
+python3 $DT_REPO_PATH/packages/circle.py
 
 # ----------------------------------------------------------------------------
 # YOUR CODE ABOVE THIS LINE
