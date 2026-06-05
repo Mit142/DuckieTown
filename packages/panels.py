@@ -58,7 +58,7 @@ class LaneFollowerWithPanels(DTROS):
         self.WORK_W, self.WORK_H = 640, 480
         self.PANEL_W, self.PANEL_H = 320, 240
         self.roi_top_ratio = float(rospy.get_param("~roi_top_ratio", 0.5))
-        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.35))
+        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.55))
 
         # ---- HSV thresholds ------------------------------------------------
         self.yellow_lo = np.array([20, 70, 100], dtype=np.uint8)
@@ -74,9 +74,8 @@ class LaneFollowerWithPanels(DTROS):
 
         # ---- control / wheel-mixing (TUNE) ---------------------------------
         self.base_speed = float(rospy.get_param("~base_speed", 0.15))        
-        self.kp = 0.25         # Lower from 0.40 (stops aggressive over-correction)
-        self.turn_max = 0.20       
-        self.ki = float(rospy.get_param("~ki", 0.0))
+        self.kp = 0.35         # Lower from 0.40 (stops aggressive over-correction)
+        self.turn_max = float(rospy.get_param("~turn_max", 0.35))  
         self.kd = float(rospy.get_param("~kd", 0.05))
         self.wheel_min = float(rospy.get_param("~wheel_min", -0.4))
         self.wheel_max = float(rospy.get_param("~wheel_max", 0.6))
@@ -211,7 +210,7 @@ class LaneFollowerWithPanels(DTROS):
 
         # ---- FIX: Single-Line Fallback Logic ----
         # 160px is roughly half the lane width in your 320px wide ROI panel
-        lane_half_width = 160 
+        lane_half_width = 220 
 
         if yellow_seen and white_seen:
             # Normal operation: both lines visible
