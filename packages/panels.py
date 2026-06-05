@@ -40,14 +40,17 @@ from sensor_msgs.msg import CompressedImage
 from duckietown_msgs.msg import WheelsCmdStamped
 from duckietown.dtros import DTROS, NodeType
 
-class LaneFollowerWithPanels:
-
+class LaneFollowerWithPanels(DTROS):
+ 
     WINDOW = "lane follow panels"
     SHOW_WINDOW = True     # False -> headless (no X needed at all)
     DISPLAY_SCALE = 0.7    # shrink the window only; lower if it lags over X
 
     def __init__(self):
-        rospy.init_node("lane_follow_panels", anonymous=False)
+        super(LaneFollowerWithPanels, self).__init__(
+            node_name="lane_follow_panels", 
+            node_type=NodeType.GENERIC
+        )
 
         self.veh = os.environ.get("VEHICLE_NAME", "entebot208")
 
