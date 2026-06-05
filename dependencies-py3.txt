@@ -2,4 +2,3 @@
 # NOTE: only place non-Duckietown libraries here; pin versions only if necessary
 opencv-python-headless
 numpy
-duckietown_msgs
