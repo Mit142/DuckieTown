@@ -17,7 +17,7 @@ export ROS_IP=$(hostname -I | awk '{print $1}')
 python3 $DT_REPO_PATH/packages/panels.py
 
 """
-dt-exec python3 $DT_REPO_PATH/packages/laneFollowing.py \
+dt-exec python3 $DT_REPO_PATH/packages/panels.py \
     __name:=lane_following_node \
     __ns:=/${VEHICLE_NAME} \
     ~image/compressed:=/${VEHICLE_NAME}/camera_node/image/compressed \
