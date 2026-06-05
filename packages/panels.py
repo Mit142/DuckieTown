@@ -38,7 +38,7 @@ import rospy
 from cv_bridge import CvBridge, CvBridgeError
 from sensor_msgs.msg import CompressedImage
 from duckietown_msgs.msg import WheelsCmdStamped
-
+from duckietown.dtros import DTROS, NodeType
 
 class LaneFollowerWithPanels:
 
