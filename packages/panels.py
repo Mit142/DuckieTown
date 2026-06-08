@@ -1,43 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-panels.py  (LANE FOLLOWER + LIVE imshow PANELS, in one node)
-============================================================
-Drives the bot AND shows the 6-panel debug view in an OpenCV window, in ONE
-node, so the panels always match what is actually driving.
+panels.py  (LANE FOLLOWER + LIVE PANELS, in one node)
+=====================================================
+Drives the bot AND shows the 6-panel debug view, in ONE node, so the panels
+always match what is actually driving.
 
   * DRIVES: publishes WheelsCmdStamped (vel_left, vel_right) to
     /<veh>/wheels_driver_node/wheels_cmd.
-  * SHOWS: cv2.imshow window of the 2x3 panel matrix. Panel 6 prints the live
-    error AND the L/R wheel commands, so you see the calculation drive the bot.
+  * SHOWS: either a cv2.imshow window OR a compressed ROS debug topic (or both).
 
-DISPLAY / X11 (runtime, NOT in this code):
-  The window appears wherever DISPLAY points. You set that in your run command
-  (XLaunch + DISPLAY=<laptop_ip>:0.0). This file does not hardcode any of that.
+------------------------------------------------------------------------------
+CHANGES IN THIS VERSION (display + turning power)
+------------------------------------------------------------------------------
+DISPLAY (less lag over a network):
+  * SHOW_WINDOW now defaults True. DISPLAY_SCALE lowered to 0.5 and panel_rate
+    lowered to 5 Hz to cut bandwidth/lag over X11.
+  * NEW: PUBLISH_DEBUG. Instead of (or alongside) X11 imshow, the panel matrix
+    is published as a COMPRESSED ROS image on
+        /<veh>/lane_follow_panels/compressed
+    View it on your laptop with `rqt_image_view` or the Duckietown dashboard.
+    This is far smoother than networked X11 and cannot segfault the driver.
 
-  >>> CRASH-PROOF <<<  If the X11 connection drops (common with a networked X
-  server), imshow would normally SEGFAULT and kill the driver mid-drive. Here
-  every GUI call is guarded: a dead display just disables the window and the
-  bot KEEPS DRIVING. Set SHOW_WINDOW=False to run fully headless.
+TURNING POWER (left/inside wheel stalling):
+  * WHEEL DEADZONE COMPENSATION: any nonzero wheel command is bumped up to at
+    least `wheel_deadzone` so the motor overcomes static friction (stiction)
+    instead of buzzing in place.
+  * wheel_min raised to ~0.08 so the INSIDE wheel keeps rolling through a hard
+    turn (tight arc) instead of being clipped to 0 and skidding (pivot). Still
+    >= 0, so no reverse and no "360 spin".
+  * PER-WHEEL TRIM: left_trim / right_trim let you compensate for motor
+    imbalance. NOTE: publishing WheelsCmdStamped directly BYPASSES the robot's
+    kinematics_node calibration (gain/trim/k/limit), so a chronically weak
+    wheel is expected unless you trim here -- or publish Twist2DStamped through
+    the calibrated pipeline instead.
 
-  >>> MESSAGE TYPE <<<  Publishes WheelsCmdStamped. If
-  `rostopic info /<veh>/wheels_driver_node/wheels_cmd` shows a different type,
-  change the import + publish_wheels().
-  >>> LAUNCHER <<<  Only THIS node should publish wheel commands. If
-  laneFollowing.py also drives, disable it or they will fight.
+  * kp is now a rosparam so you can tune it live (`rosparam set ~kp ...`).
 
-SAFETY: wheels zeroed on shutdown and whenever the lane is lost. Test on
-blocks; check steering direction (steer_sign) before the floor.
-
-TURN/SPEED FIXES (vs original):
-  * wheel_min 0.0 (was -0.4): inside wheel can no longer reverse, so the bot
-    arcs tightly instead of pivoting in place -> kills the "360 spin".
-  * base_speed 0.22 (was 0.15): faster cruise.
-  * kp 0.45, turn_max 0.5: commits to curves earlier and harder so the line
-    stays in frame.
-  * kd 0.08 (was 0.05): damps the higher kp to avoid straight-line wobble.
-  * turn slowdown factor 0.3 (was 0.5): keeps momentum through turns so it
-    arcs instead of crawling.
+SAFETY: wheels zeroed on shutdown and whenever the lane is lost. The stop path
+publishes 0.0 directly and does NOT pass through wheel_min, so the bot still
+fully stops. Test on blocks; check steer_sign before the floor.
 """
 
 import os
@@ -50,15 +52,19 @@ from sensor_msgs.msg import CompressedImage
 from duckietown_msgs.msg import WheelsCmdStamped
 from duckietown.dtros import DTROS, NodeType
 
+
 class LaneFollowerWithPanels(DTROS):
- 
+
     WINDOW = "lane follow panels"
-    SHOW_WINDOW = False     # False -> headless (no X needed at all)
-    DISPLAY_SCALE = 0.7    # shrink the window only; lower if it lags over X
+    SHOW_WINDOW = True      # cv2.imshow window (needs DISPLAY). False -> no X11 window.
+    PUBLISH_DEBUG = False    # publish compressed panel image on a ROS topic (laptop-friendly)
+    DISPLAY_SCALE = 0.5     # shrink the imshow window only; lower if it lags over X
+    DEBUG_SCALE = 0.6       # shrink the published debug image (smaller = less bandwidth)
+    DEBUG_JPEG_QUALITY = 60 # 1..100; lower = smaller/faster, blurrier
 
     def __init__(self):
         super(LaneFollowerWithPanels, self).__init__(
-            node_name="lane_follow_panels", 
+            node_name="lane_follow_panels",
             node_type=NodeType.GENERIC
         )
 
@@ -83,18 +89,36 @@ class LaneFollowerWithPanels(DTROS):
         self.ema_alpha = 0.4
 
         # ---- control / wheel-mixing (TUNE) ---------------------------------
-        self.base_speed = float(rospy.get_param("~base_speed", 0.22))       # was 0.15 (fixes "slow")
-        self.kp = 0.45         # was 0.35 (commit to curves earlier)
-        self.turn_max = float(rospy.get_param("~turn_max", 0.5))            # was 0.35 (more steering authority)
-        self.kd = float(rospy.get_param("~kd", 0.08))                       # was 0.05 (damps the higher kp)
-        self.ki = float(rospy.get_param("~ki", 0.0))  
-        self.wheel_min = float(rospy.get_param("~wheel_min", 0.0))          # was -0.4  <-- THE KEY FIX (no pivot-in-place)
-        self.wheel_max = float(rospy.get_param("~wheel_max", 0.6))
+        self.base_speed = float(rospy.get_param("~base_speed", 0.22))
+        self.kp = float(rospy.get_param("~kp", 0.45))                       # now a param (live-tunable)
+        self.turn_max = float(rospy.get_param("~turn_max", 0.5))
+        self.kd = float(rospy.get_param("~kd", 0.08))
+        self.ki = float(rospy.get_param("~ki", 0.0))
+        self.turn_slowdown = float(rospy.get_param("~turn_slowdown", 0.3))  # base speed cut in turns
         self.deadband_norm = float(rospy.get_param("~deadband_norm", 0.02))
         self.control_rate = float(rospy.get_param("~control_rate", 15.0))   # Hz
-        self.panel_rate = float(rospy.get_param("~panel_rate", 8.0))        # Hz
+        self.panel_rate = float(rospy.get_param("~panel_rate", 5.0))        # Hz (was 8; lower = less lag)
         self.lost_timeout = float(rospy.get_param("~lost_timeout", 1.0))
-        self.steer_sign = float(rospy.get_param("~steer_sign", 1.0))  # flip -1.0 if wrong way
+        self.steer_sign = float(rospy.get_param("~steer_sign", 1.0))        # flip -1.0 if wrong way
+
+        # ---- wheel limits + stiction / trim (TURNING-POWER FIX) ------------
+        # wheel_min raised off 0.0 so the inside wheel keeps rolling (arc) in a
+        # hard turn instead of stalling/skidding. Still >= 0 -> no reverse/spin.
+        self.wheel_min = float(rospy.get_param("~wheel_min", 0.08))
+        self.wheel_max = float(rospy.get_param("~wheel_max", 0.6))
+        # Any nonzero command below this can't beat static friction -> bump up.
+        self.wheel_deadzone = float(rospy.get_param("~wheel_deadzone", 0.10))
+        # Per-wheel trim to compensate motor imbalance (calibration is bypassed
+        # when publishing wheels_cmd directly). >1.0 = stronger wheel.
+        self.left_trim = float(rospy.get_param("~left_trim", 1.0))
+        self.right_trim = float(rospy.get_param("~right_trim", 1.0))
+
+        # ---- derivative filtering / lane-width learning --------------------
+        self.d_alpha = float(rospy.get_param("~d_alpha", 0.3))
+        self.width_alpha = float(rospy.get_param("~width_alpha", 0.1))
+        self.lane_half_width = float(rospy.get_param("~lane_half_width", 220.0))
+        self.half_width_min = 120.0
+        self.half_width_max = 320.0
 
         # ---- state ---------------------------------------------------------
         self.yellow_line = None
@@ -102,6 +126,7 @@ class LaneFollowerWithPanels(DTROS):
         self.smooth_center_x = None
         self.err_prev = 0.0
         self.err_integral = 0.0
+        self.de_filt = 0.0
         self.last_seen_time = rospy.Time.now()
         self.latest = None
         self._last_panel_t = 0.0
@@ -118,15 +143,23 @@ class LaneFollowerWithPanels(DTROS):
             queue_size=1, buff_size=2 ** 22)
         self.pub_wheels = rospy.Publisher(self.wheels_topic, WheelsCmdStamped, queue_size=1)
 
+        # optional compressed debug image (view with rqt_image_view on laptop)
+        self.pub_debug = None
+        if self.PUBLISH_DEBUG:
+            self.debug_topic = "/{}/lane_follow_panels/compressed".format(self.veh)
+            self.pub_debug = rospy.Publisher(self.debug_topic, CompressedImage, queue_size=1)
+
         rospy.on_shutdown(self.stop)
 
         rospy.loginfo("[lane_follow] vehicle = %s", self.veh)
         rospy.loginfo("[lane_follow] camera  = %s", self.cam_topic)
         rospy.loginfo("[lane_follow] wheels  = %s", self.wheels_topic)
-        rospy.loginfo("[lane_follow] window  = %s (DISPLAY=%s)",
-                      self.SHOW_WINDOW, os.environ.get("DISPLAY", "<unset>"))
-        rospy.loginfo("[lane_follow] base=%.2f kp=%.2f kd=%.2f",
-                      self.base_speed, self.kp, self.kd)
+        rospy.loginfo("[lane_follow] window  = %s  publish_debug = %s (DISPLAY=%s)",
+                      self.SHOW_WINDOW, self.PUBLISH_DEBUG, os.environ.get("DISPLAY", "<unset>"))
+        if self.pub_debug is not None:
+            rospy.loginfo("[lane_follow] debug   = %s", self.debug_topic)
+        rospy.loginfo("[lane_follow] base=%.2f kp=%.2f kd=%.2f wheel_min=%.2f deadzone=%.2f",
+                      self.base_speed, self.kp, self.kd, self.wheel_min, self.wheel_deadzone)
 
     # ----------------------------------------------------------------------- #
     #  CV helpers
@@ -162,6 +195,30 @@ class LaneFollowerWithPanels(DTROS):
         cv2.putText(img, label, (4, 13), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (255, 255, 255), 1, cv2.LINE_AA)
         return img
+
+    # ----------------------------------------------------------------------- #
+    #  Wheel-command conditioning: trim, stiction deadzone, clamp.
+    # ----------------------------------------------------------------------- #
+    def _apply_deadzone(self, v):
+        """Bump a small nonzero command up to the stiction floor so the motor
+        actually turns. Exact 0 stays 0 (full stop is allowed)."""
+        if v > 1e-3:
+            return max(v, self.wheel_deadzone)
+        if v < -1e-3:
+            return min(v, -self.wheel_deadzone)
+        return 0.0
+
+    def _condition_wheels(self, vel_left, vel_right):
+        # 1) per-wheel trim (compensate motor imbalance / bypassed calibration)
+        vel_left *= self.left_trim
+        vel_right *= self.right_trim
+        # 2) stiction deadzone compensation
+        vel_left = self._apply_deadzone(vel_left)
+        vel_right = self._apply_deadzone(vel_right)
+        # 3) clamp to [wheel_min, wheel_max] (wheel_min keeps inside wheel rolling)
+        vel_left = float(np.clip(vel_left, self.wheel_min, self.wheel_max))
+        vel_right = float(np.clip(vel_right, self.wheel_min, self.wheel_max))
+        return vel_left, vel_right
 
     # ----------------------------------------------------------------------- #
     #  Camera callback
@@ -219,24 +276,18 @@ class LaneFollowerWithPanels(DTROS):
         xl = self._x_at_y(self.yellow_line, look_y)
         xr = self._x_at_y(self.white_line, look_y)
 
-        # ---- Single-Line Fallback Logic ----
-        # NOTE: this is in the 640-px-wide ROI (NOT the 320-px display panel).
-        # 220 ~= half the lane width in ROI pixels. If the bot wanders the
-        # instant one line drops out, measure the real yellow<->white gap at
-        # look_y and set this to half of that.
-        lane_half_width = 220 
-
+        # ---- Single-Line Fallback Logic (SELF-CALIBRATING WIDTH) ----
         if yellow_seen and white_seen:
-            # Normal operation: both lines visible
             lane_center_x = (xl + xr) / 2.0
+            half = (xr - xl) / 2.0
+            if self.half_width_min <= half <= self.half_width_max:
+                self.lane_half_width = (self.width_alpha * half
+                                        + (1.0 - self.width_alpha) * self.lane_half_width)
         elif white_seen:
-            # Lost the yellow line! Estimate center using only the white line
-            lane_center_x = xr - lane_half_width
+            lane_center_x = xr - self.lane_half_width
         elif yellow_seen:
-            # Lost the white line! Estimate center using only the yellow line
-            lane_center_x = xl + lane_half_width
+            lane_center_x = xl + self.lane_half_width
         else:
-            # Blind! Hold the last known smooth center to coast through
             lane_center_x = self.smooth_center_x
 
         self.smooth_center_x = (self.ema_alpha * lane_center_x
@@ -349,6 +400,29 @@ class LaneFollowerWithPanels(DTROS):
             self._display_ok = False
         return False
 
+    def _publish_debug(self, matrix):
+        """Publish the panel matrix as a compressed ROS image. View on the
+        laptop with: rosrun image_view image_view image:=<topic> _image_transport:=compressed
+        or rqt_image_view. Much smoother than networked X11."""
+        if self.pub_debug is None:
+            return
+        try:
+            if self.DEBUG_SCALE != 1.0:
+                matrix = cv2.resize(matrix, None,
+                                    fx=self.DEBUG_SCALE, fy=self.DEBUG_SCALE,
+                                    interpolation=cv2.INTER_NEAREST)
+            ok, enc = cv2.imencode(".jpg", matrix,
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), self.DEBUG_JPEG_QUALITY])
+            if not ok:
+                return
+            msg = CompressedImage()
+            msg.header.stamp = rospy.Time.now()
+            msg.format = "jpeg"
+            msg.data = enc.tobytes()
+            self.pub_debug.publish(msg)
+        except Exception as exc:
+            rospy.logwarn_throttle(2.0, "[lane_follow] debug publish error: %s" % exc)
+
     # ----------------------------------------------------------------------- #
     #  Control + display loop
     # ----------------------------------------------------------------------- #
@@ -363,6 +437,7 @@ class LaneFollowerWithPanels(DTROS):
         rate = rospy.Rate(self.control_rate)
         dt = 1.0 / self.control_rate
         panel_period = 0.0 if self.panel_rate <= 0 else 1.0 / self.panel_rate
+        want_panels = self._display_ok or (self.pub_debug is not None)
 
         while not rospy.is_shutdown():
             frame = self.latest
@@ -376,28 +451,34 @@ class LaneFollowerWithPanels(DTROS):
             since_seen = (rospy.Time.now() - self.last_seen_time).to_sec()
             if since_seen > self.lost_timeout:
                 vel_left = vel_right = 0.0
+                # reset ALL controller state so re-acquiring doesn't lurch
                 self.err_integral = 0.0
+                self.err_prev = 0.0
+                self.de_filt = 0.0
             else:
                 e = vis["err_norm"]
                 if abs(e) < self.deadband_norm:
                     e = 0.0
                 self.err_integral = float(np.clip(self.err_integral + e * dt, -1.0, 1.0))
-                de = (e - self.err_prev) / dt
+                de_raw = (e - self.err_prev) / dt
                 self.err_prev = e
-                control = self.kp * e + self.ki * self.err_integral + self.kd * de
+                self.de_filt = (self.d_alpha * de_raw
+                                + (1.0 - self.d_alpha) * self.de_filt)
+                control = self.kp * e + self.ki * self.err_integral + self.kd * self.de_filt
                 turn = float(np.clip(self.steer_sign * control, -self.turn_max, self.turn_max))
-                base = self.base_speed * (1.0 - 0.3 * min(abs(e), 1.0))   # was 0.5 — keep momentum through turns
-                vel_left = float(np.clip(base + turn, self.wheel_min, self.wheel_max))
-                vel_right = float(np.clip(base - turn, self.wheel_min, self.wheel_max))
+                base = self.base_speed * (1.0 - self.turn_slowdown * min(abs(e), 1.0))
+                # mix, then condition (trim -> stiction deadzone -> clamp)
+                vel_left, vel_right = self._condition_wheels(base + turn, base - turn)
 
             self.publish_wheels(vel_left, vel_right)
 
             # ---- panels (rate-limited; never blocks driving) ----
             now = rospy.get_time()
-            if self._display_ok and (panel_period <= 0.0 or (now - self._last_panel_t) >= panel_period):
+            if want_panels and (panel_period <= 0.0 or (now - self._last_panel_t) >= panel_period):
                 try:
                     matrix = self.build_panels(vis, vel_left, vel_right)
                     self._safe_show(matrix)
+                    self._publish_debug(matrix)
                     self._last_panel_t = now
                 except Exception as exc:
                     rospy.logwarn_throttle(2.0, "[lane_follow] panel error: %s" % exc)
@@ -436,4 +517,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
