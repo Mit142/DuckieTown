@@ -13,42 +13,30 @@ DISPLAY + DRIVE variant of the 6-panel lane-debug node (ROS Noetic).
 
 FIXES IN THIS VERSION
 ---------------------
-FIX 1 — ONE WHEEL NOT TURNING
-  _compute_control() was normalising the pixel error against img_center_x
-  (half the ROI width = 320 px).  That's far too wide: a real Duckietown lane
-  is ~90–110 px across at the ROI, so the normalised error was always tiny and
-  omega never climbed high enough to split the wheel speeds meaningfully.
-  Now the actual lane_half_width (px) is passed as the normalisation
-  denominator. If it hasn't been measured yet the code falls back to
-  img_center_x so behaviour before the first observation is unchanged.
+FIX 5 — UNDERSTEERS / "ONE WHEEL NOT TURNING" ON CORNERS
+  omega_slew was 3.0 rad/s^2. At control_rate=30 Hz that is only
+  ~0.1 rad/s of steering change PER FRAME, so omega could not ramp up
+  before the bot had already driven off the outside of the corner. With
+  omega tiny, the inner wheel barely differentiates (often below the
+  motor's stall threshold) -> looks like one wheel isn't turning.
+  Raised to 15.0 rad/s^2 (~0.5 rad/s per frame -> reaches omega_max in
+  ~0.27 s): responsive, still smoothed. If a post-turn wobble comes back,
+  nudge DOWN toward 8-10; if it still understeers, push toward 20.
 
-FIX 2 — BOT HUGS WHITE LINE
-  The lane_half_width default was rw*0.25 = 160 px — about double the real
-  lane.  Every time only white was seen the code placed lane_center as
-  xr - 160 px, which is far to the LEFT of real center; EMA then dragged the
-  smoothed target toward white.  Default is now 90 px (close to real), and
-  the EMA update weight was raised so it converges in ~10 frames with both
-  lines visible.
+FIX 6 — NOT CENTERED ON STRAIGHTS (HUGS THE WHITE LINE)
+  On a wide track the dashed yellow is often not seen, so the bot runs in
+  WHITE-ONLY mode where  lane_center = xr - lane_half_width.  If the stored
+  half-width is too small, the target sits to the RIGHT of true center, so
+  the bot rides the white line. Two handles:
+    a) A once-per-second diagnostic log now prints the MEASURED half-width
+       and which lines are seen. Drive a straight with BOTH lines visible,
+       read the steady "half_w" value, and set ~lane_half_width_init to it.
+    b) ~center_offset_px shifts the steering target. If it still hugs white
+       (right), set this NEGATIVE (e.g. -25) to pull the target left toward
+       true center. Positive pushes right. This is the quick trim.
 
-FIX 3 — CROSSES LANE AFTER TURNS
-  Two interacting causes:
-    a) ema_alpha = 0.6 was high enough that the smoothed lane-center lagged
-       badly in turns; the robot turned too late, overshot, and then
-       overcorrected.  Lowered to 0.35 — faster tracking, less lag.
-    b) omega_slew = 10.0 rad/s² was so loose it never fired.  Tightened to
-       3.0 rad/s² so exiting a corner can't snap into a hard opposite turn
-       in one frame.
-
-FIX 4 — BOT ONLY MOVES AFTER DISPLAY WINDOW IS CLICKED
-  The drive loop and cv2.waitKey() shared the same thread.  On systems where
-  X11 forwarding hasn't fully rendered the window yet, waitKey() can stall
-  until the window is focused/clicked, blocking the publish loop entirely.
-  Solution: the control + CV pipeline runs in a dedicated background thread
-  at the full control rate.  The main thread owns ONLY the GUI (imshow +
-  waitKey).  The two threads share `self.latest` (newest frame) and
-  `self._display_matrix` (newest debug image) through simple assignments,
-  which is safe for CPython because assignment is atomic.  The drive commands
-  are published from the background thread regardless of display state.
+(earlier fixes 1-4 retained: lane-width normalisation, faster EMA, robust
+single-line center, and the GUI/control thread split.)
 
 COMMAND TOPIC
 -------------
@@ -79,7 +67,6 @@ class LanePanelsDrive:
 
     def __init__(self):
         rospy.init_node("panels", anonymous=False)
-
         self.veh = os.environ.get("VEHICLE_NAME", "entebot208")
 
         # Geometry
@@ -102,8 +89,6 @@ class LanePanelsDrive:
         self.canny_lo, self.canny_hi = 60, 160
         self.kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self.deadband = 8
-
-        # FIX 2: lower ema_alpha so the smoothed center tracks turns faster
         self.ema_alpha = float(rospy.get_param("~ema_alpha", 0.35))
 
         # ---- Control tunables -------------------------------------------
@@ -113,19 +98,21 @@ class LanePanelsDrive:
         self.Kp             = float(rospy.get_param("~kp",             2.2))
         self.Kd             = float(rospy.get_param("~kd",             0.4))
         self.omega_max      = float(rospy.get_param("~omega_max",      4.0))
-        # FIX 3b: tightened slew so a post-turn snap can't overshoot
-        self.omega_slew     = float(rospy.get_param("~omega_slew",     3.0))
+        # FIX 5: slew loosened 3.0 -> 15.0 so corners can actually be taken.
+        self.omega_slew     = float(rospy.get_param("~omega_slew",     15.0))
         self.turn_slowdown  = float(rospy.get_param("~turn_slowdown",  0.6))
         self.d_alpha        = float(rospy.get_param("~d_alpha",        0.5))
         self.omega_sign     = float(rospy.get_param("~omega_sign",    -1.0))
         self.lost_timeout   = float(rospy.get_param("~lost_timeout",   0.6))
+        # FIX 6b: lateral trim. NEGATIVE pulls target left (off the white line).
+        self.center_offset_px = float(rospy.get_param("~center_offset_px", 0.0))
 
         # ---- Persistent vision state ------------------------------------
         self.yellow_line    = None
         self.white_line     = None
         self.smooth_center_x = None
-        # FIX 2: realistic initial half-width (~90 px for a Duckietown lane)
-        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 90.0))
+        # FIX 6a: set this to the half_w value you read from the diagnostic log.
+        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 110.0))
         self.yellow_seen    = False
         self.white_seen     = False
 
@@ -139,10 +126,10 @@ class LanePanelsDrive:
         self._cmd_omega   = 0.0
 
         # ---- Shared data between threads --------------------------------
-        self.latest          = None   # newest raw frame  (callback -> ctrl thread)
-        self._display_matrix = None   # newest debug image (ctrl thread -> GUI thread)
+        self.latest          = None
+        self._display_matrix = None
         self._frames         = 0
-        self._quit           = False  # set by GUI thread; ctrl thread sees it
+        self._quit           = False
 
         # ---- ROS plumbing -----------------------------------------------
         self.bridge    = CvBridge()
@@ -151,10 +138,8 @@ class LanePanelsDrive:
             self.cam_topic, CompressedImage, self.image_callback,
             queue_size=1, buff_size=2 ** 22,
         )
-
         self.cmd_topic = "/{}/car_cmd_switch_node/cmd".format(self.veh)
         self.pub = rospy.Publisher(self.cmd_topic, Twist2DStamped, queue_size=1)
-
         rospy.on_shutdown(self._publish_stop)
 
         rospy.loginfo("[panels] vehicle       = %s", self.veh)
@@ -210,7 +195,6 @@ class LanePanelsDrive:
     # ======================================================================
     def _compute_control(self, error_px, lane_half_width_px, lane_seen):
         now = rospy.get_time()
-
         if lane_seen:
             self._last_seen_t = now
         if self._last_seen_t is None or (now - self._last_seen_t) > self.lost_timeout:
@@ -219,9 +203,6 @@ class LanePanelsDrive:
             self._prev_omega = 0.0
             return 0.0, 0.0
 
-        # FIX 1: normalise against actual lane half-width, not image half-width.
-        # This makes Kp resolution-agnostic AND gives omega the full [-1,1]
-        # dynamic range for a real lane offset.
         norm = float(max(1, lane_half_width_px))
         e = float(np.clip(float(error_px) / norm, -1.0, 1.0))
 
@@ -272,14 +253,13 @@ class LanePanelsDrive:
         self.latest = cv2.resize(frame, (self.WORK_W, self.WORK_H))
         self._frames += 1
         if self._frames == 1:
-            rospy.loginfo("[panels] first camera frame received — pipeline live")
+            rospy.loginfo("[panels] first camera frame received -- pipeline live")
 
     # ======================================================================
-    #  CV + control pipeline (runs in background thread, never blocks on GUI)
+    #  CV + control pipeline (runs in background thread)
     # ======================================================================
     def process_frame(self, frame):
         h, w = frame.shape[:2]
-
         roi_y1 = int(h * self.roi_top_ratio)
         roi_y2 = h
         roi    = frame[roi_y1:roi_y2, 0:w].copy()
@@ -305,7 +285,6 @@ class LanePanelsDrive:
                 cen = self._centroid(c)
                 if cen is not None:
                     yellow_centroids.append(cen)
-
         if len(yellow_centroids) >= 2:
             pts = np.array(yellow_centroids, dtype=np.float32)
             self.yellow_line = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
@@ -330,7 +309,6 @@ class LanePanelsDrive:
         cv2.rectangle(panel1, (0, roi_y1), (w - 1, roi_y2 - 1), (0, 255, 0), 2)
         cv2.putText(panel1, "ROI", (6, roi_y1 + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-
         panel2 = yellow_mask
         panel3 = white_mask
 
@@ -345,19 +323,16 @@ class LanePanelsDrive:
                  (self._x_at_y(self.white_line, y_top), y_top),
                  (self._x_at_y(self.white_line, y_bot), y_bot),
                  (200, 200, 200), 1)
-
         for i in range(6):
             y   = int(rh * (i + 0.5) / 6)
             xl  = int(np.clip(self._x_at_y(self.yellow_line, y), 0, rw - 1))
             xr  = int(np.clip(self._x_at_y(self.white_line,  y), 0, rw - 1))
             cv2.line(panel4, (xl, y), (xr, y), (0, 255, 0), 1)
             cv2.circle(panel4, ((xl + xr) // 2, y), 2, (0, 0, 255), -1)
-
         for cen in yellow_centroids:
             cv2.circle(panel4, cen, 3, (0, 255, 255), -1)
         if white_centroid is not None:
             cv2.circle(panel4, white_centroid, 3, (255, 255, 255), -1)
-
         if not self.yellow_seen:
             cv2.putText(panel4, "Y:last", (4, rh - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
@@ -381,7 +356,6 @@ class LanePanelsDrive:
             lane_center_x = (xl + xr) / 2.0
             hw = (xr - xl) / 2.0
             if hw > rw * 0.05:
-                # FIX 2: faster convergence (weight 0.5 vs old 0.3)
                 self.lane_half_width = 0.5 * self.lane_half_width + 0.5 * hw
         elif self.yellow_seen:
             lane_center_x = xl + self.lane_half_width
@@ -390,16 +364,23 @@ class LanePanelsDrive:
         else:
             lane_center_x = self.smooth_center_x
 
-        # FIX 3a: lower ema_alpha → faster tracking through turns
         self.smooth_center_x = (self.ema_alpha * lane_center_x
                                 + (1.0 - self.ema_alpha) * self.smooth_center_x)
-        target_x = int(np.clip(self.smooth_center_x, 0, rw - 1))
+
+        # FIX 6b: apply lateral trim, then compute error vs image center.
+        target_x = int(np.clip(self.smooth_center_x + self.center_offset_px, 0, rw - 1))
         error    = target_x - img_center_x
 
-        # FIX 1: pass lane_half_width (not img_center_x) as normaliser
         lane_seen  = self.yellow_seen or self.white_seen
         v, omega   = self._compute_control(error, self.lane_half_width, lane_seen)
         self._cmd_v, self._cmd_omega = v, omega
+
+        # FIX 6a: once-a-second diagnostic so you can tune half-width/offset.
+        rospy.loginfo_throttle(
+            1.0,
+            "[panels] Y=%d W=%d half_w=%.0f err=%+d v=%.2f w=%+.2f"
+            % (int(self.yellow_seen), int(self.white_seen),
+               self.lane_half_width, error, v, omega))
 
         # ---- Panel 6: steering indicator --------------------------------
         panel6 = cv2.convertScaleAbs(roi, alpha=0.4)
@@ -408,7 +389,6 @@ class LanePanelsDrive:
         cv2.arrowedLine(panel6, (img_center_x, rh - 1), (target_x, look_y),
                         (0, 0, 255), 2, tipLength=0.2)
         cv2.circle(panel6, (target_x, look_y), 4, (0, 255, 0), -1)
-
         direction = "STRAIGHT" if abs(error) < self.deadband else ("RIGHT" if error > 0 else "LEFT")
         cv2.putText(panel6, "err {:+d}px {}".format(error, direction),
                     (4, rh - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
@@ -424,7 +404,7 @@ class LanePanelsDrive:
         return np.vstack([top_row, bottom_row])
 
     # ======================================================================
-    #  _show — display helper (called from main/GUI thread only)
+    #  _show — display helper (main/GUI thread only)
     # ======================================================================
     def _show(self, matrix):
         if self.DISPLAY_SCALE != 1.0:
@@ -440,9 +420,7 @@ class LanePanelsDrive:
                 "-headless) to dependencies-py3.txt and rebuild." % exc)
 
     # ======================================================================
-    #  FIX 4 — CONTROL THREAD
-    #  Runs the CV pipeline + publishes drive commands independently of the
-    #  GUI.  The main thread only calls imshow/waitKey; it never blocks drive.
+    #  Control thread: CV + publish, independent of GUI
     # ======================================================================
     def _control_loop(self):
         rate = rospy.Rate(self.control_rate)
@@ -451,35 +429,27 @@ class LanePanelsDrive:
             if frame is not None:
                 try:
                     matrix = self.process_frame(frame)
-                    # Atomic assignment — safe to read from main thread in CPython
                     self._display_matrix = matrix
                 except Exception as exc:
                     rospy.logwarn_throttle(2.0, "[panels] pipeline error: %s" % exc)
                     self._cmd_v, self._cmd_omega = 0.0, 0.0
-
             if self.enable_drive:
                 self._publish_cmd(self._cmd_v, self._cmd_omega)
-
             try:
                 rate.sleep()
             except rospy.ROSInterruptException:
                 break
-
         self._publish_stop()
 
     # ======================================================================
-    #  spin — main (GUI) thread: imshow + waitKey only, never blocks drive
+    #  spin — main (GUI) thread: imshow + waitKey only
     # ======================================================================
     def spin(self):
-        # Start the control loop in a daemon thread so it is killed when
-        # the main process exits.
         ctrl_thread = threading.Thread(target=self._control_loop, daemon=True)
         ctrl_thread.start()
 
         cv2.namedWindow(self.WINDOW, cv2.WINDOW_AUTOSIZE)
         self._show(self._placeholder("waiting for camera..."))
-        # waitKey(1) is called immediately — window exists but we do NOT
-        # wait for a click before the control thread starts publishing.
         cv2.waitKey(1)
 
         gui_rate = rospy.Rate(self.display_rate)
@@ -489,13 +459,9 @@ class LanePanelsDrive:
                 self._show(matrix)
             else:
                 self._show(self._placeholder("waiting for camera..."))
-
-            # waitKey drives the Qt/GTK event loop; 1 ms timeout keeps it
-            # non-blocking relative to the control thread.
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 self._quit = True
                 break
-
             try:
                 gui_rate.sleep()
             except rospy.ROSInterruptException:
