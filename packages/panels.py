@@ -110,7 +110,7 @@ class LanePanelsDrive:
         self.white_line     = None
         self.smooth_center_x = None
         # FIX 6a: set this to the half_w value you read from the diagnostic log.
-        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 135.0))        \
+        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 135.0))
         self.yellow_seen    = False
         self.white_seen     = False
 
