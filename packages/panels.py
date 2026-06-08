@@ -79,7 +79,7 @@ class LanePanelsDrive:
 
         # ---- Vision tunables (overridable via the ROS param server) -------
         self.roi_top_ratio = float(rospy.get_param("~roi_top_ratio", 0.5))
-        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.35))
+        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.50)) # Changed from 0.35
         self.display_rate = float(rospy.get_param("~display_rate", 15.0))  # Hz
 
         # HSV thresholds (OpenCV: H 0-179, S 0-255, V 0-255). Retune for light.
@@ -97,11 +97,12 @@ class LanePanelsDrive:
 
         # ---- Control tunables (THE knobs for your two symptoms) -----------
         self.enable_drive = bool(rospy.get_param("~enable_drive", True))
-        self.v_nominal = float(rospy.get_param("~v_nominal", 0.23))   # m/s straight
-        self.v_min = float(rospy.get_param("~v_min", 0.08))           # m/s floor
-        self.Kp = float(rospy.get_param("~kp", 3.0))    # rad/s per unit error
-        self.Kd = float(rospy.get_param("~kd", 0.4))    # damping (kills wobble)
-        self.omega_max = float(rospy.get_param("~omega_max", 5.0))    # rad/s clamp
+        self.v_nominal = float(rospy.get_param("~v_nominal", 0.23)) 
+        self.v_min = float(rospy.get_param("~v_min", 0.08)) 
+        self.Kp = float(rospy.get_param("~kp", 1.8))            # Changed from 3.0
+        self.Kd = float(rospy.get_param("~kd", 0.6))            # Changed from 0.4
+        self.omega_max = float(rospy.get_param("~omega_max", 3.5)) # Changed from 5.0
+
         # slow down on sharp turns: at full error, v = v_nominal*(1-turn_slowdown)
         self.turn_slowdown = float(rospy.get_param("~turn_slowdown", 0.6))
         self.d_alpha = float(rospy.get_param("~d_alpha", 0.5))  # derivative LPF
