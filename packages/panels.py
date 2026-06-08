@@ -77,6 +77,7 @@ class LaneFollowerWithPanels(DTROS):
         self.kp = 0.35         # Lower from 0.40 (stops aggressive over-correction)
         self.turn_max = float(rospy.get_param("~turn_max", 0.35))  
         self.kd = float(rospy.get_param("~kd", 0.05))
+        self.ki = float(rospy.get_param("~ki", 0.0))  
         self.wheel_min = float(rospy.get_param("~wheel_min", -0.4))
         self.wheel_max = float(rospy.get_param("~wheel_max", 0.6))
         self.deadband_norm = float(rospy.get_param("~deadband_norm", 0.02))
