@@ -98,21 +98,19 @@ class LanePanelsDrive:
         self.Kp             = float(rospy.get_param("~kp",             2.2))
         self.Kd             = float(rospy.get_param("~kd",             0.4))
         self.omega_max      = float(rospy.get_param("~omega_max",      4.0))
-        # FIX 5: slew loosened 3.0 -> 15.0 so corners can actually be taken.
-        self.omega_slew     = float(rospy.get_param("~omega_slew",     15.0))
+        self.omega_slew      = float(rospy.get_param("~omega_slew",     15.0))
         self.turn_slowdown  = float(rospy.get_param("~turn_slowdown",  0.6))
         self.d_alpha        = float(rospy.get_param("~d_alpha",        0.5))
         self.omega_sign     = float(rospy.get_param("~omega_sign",    -1.0))
         self.lost_timeout   = float(rospy.get_param("~lost_timeout",   0.6))
         # FIX 6b: lateral trim. NEGATIVE pulls target left (off the white line).
-        self.center_offset_px = float(rospy.get_param("~center_offset_px", 0.0))
-
+        self.center_offset_px = float(rospy.get_param("~center_offset_px", -25.0))
         # ---- Persistent vision state ------------------------------------
         self.yellow_line    = None
         self.white_line     = None
         self.smooth_center_x = None
         # FIX 6a: set this to the half_w value you read from the diagnostic log.
-        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 110.0))
+        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 135.0))        \
         self.yellow_seen    = False
         self.white_seen     = False
 
