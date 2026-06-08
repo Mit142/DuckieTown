@@ -3,37 +3,35 @@
 """
 panels.py
 =========
-DISPLAY + DRIVE variant of the 6-panel lane-debug node (ROS Noetic).
+DISPLAY + DRIVE variant of the 2-panel lane-debug node (ROS Noetic).
 
-    +---------------------+---------------------+---------------------+
-    | 1  RAW + ROI box    | 2  YELLOW mask      | 3  WHITE mask       |
-    +---------------------+---------------------+---------------------+
-    | 4  LANE BED overlay | 5  EDGES / combined | 6  STEERING + v/w   |
-    +---------------------+---------------------+---------------------+
+    +---------------------+---------------------+
+    | 4  LANE BED overlay | 6  STEERING + v/w   |
+    +---------------------+---------------------+
 
 FIXES IN THIS VERSION
 ---------------------
 FIX 5 — UNDERSTEERS / "ONE WHEEL NOT TURNING" ON CORNERS
-  omega_slew was 3.0 rad/s^2. At control_rate=30 Hz that is only
-  ~0.1 rad/s of steering change PER FRAME, so omega could not ramp up
-  before the bot had already driven off the outside of the corner. With
-  omega tiny, the inner wheel barely differentiates (often below the
-  motor's stall threshold) -> looks like one wheel isn't turning.
-  Raised to 15.0 rad/s^2 (~0.5 rad/s per frame -> reaches omega_max in
-  ~0.27 s): responsive, still smoothed. If a post-turn wobble comes back,
-  nudge DOWN toward 8-10; if it still understeers, push toward 20.
+ omega_slew was 3.0 rad/s^2. At control_rate=30 Hz that is only
+ ~0.1 rad/s of steering change PER FRAME, so omega could not ramp up
+ before the bot had already driven off the outside of the corner. With
+ omega tiny, the inner wheel barely differentiates (often below the
+ motor's stall threshold) -> looks like one wheel isn't turning.
+ Raised to 15.0 rad/s^2 (~0.5 rad/s per frame -> reaches omega_max in
+ ~0.27 s): responsive, still smoothed. If a post-turn wobble comes back,
+ nudge DOWN toward 8-10; if it still understeers, push toward 20.
 
 FIX 6 — NOT CENTERED ON STRAIGHTS (HUGS THE WHITE LINE)
-  On a wide track the dashed yellow is often not seen, so the bot runs in
-  WHITE-ONLY mode where  lane_center = xr - lane_half_width.  If the stored
-  half-width is too small, the target sits to the RIGHT of true center, so
-  the bot rides the white line. Two handles:
-    a) A once-per-second diagnostic log now prints the MEASURED half-width
-       and which lines are seen. Drive a straight with BOTH lines visible,
-       read the steady "half_w" value, and set ~lane_half_width_init to it.
-    b) ~center_offset_px shifts the steering target. If it still hugs white
-       (right), set this NEGATIVE (e.g. -25) to pull the target left toward
-       true center. Positive pushes right. This is the quick trim.
+ On a wide track the dashed yellow is often not seen, so the bot runs in
+ WHITE-ONLY mode where  lane_center = xr - lane_half_width.  If the stored
+ half-width is too small, the target sits to the RIGHT of true center, so
+ the bot rides the white line. Two handles:
+   a) A once-per-second diagnostic log now prints the MEASURED half-width
+      and which lines are seen. Drive a straight with BOTH lines visible,
+      read the steady "half_w" value, and set ~lane_half_width_init to it.
+   b) ~center_offset_px shifts the steering target. If it still hugs white
+      (right), set this NEGATIVE (e.g. -25) to pull the target left toward
+      true center. Positive pushes right. This is the quick trim.
 
 (earlier fixes 1-4 retained: lane-width normalisation, faster EMA, robust
 single-line center, and the GUI/control thread split.)
@@ -60,32 +58,32 @@ from duckietown_msgs.msg import Twist2DStamped
 
 
 class LanePanelsDrive:
-    """Builds + shows the 6-panel debug matrix AND drives the lane."""
+    """Builds + shows the 2-panel debug matrix AND drives the lane."""
 
     WINDOW = "lane panels"
-    DISPLAY_SCALE = 1.0   # lower if the forwarded window is slow
+    DISPLAY_SCALE = 0.5   # lower if the forwarded window is slow
 
     def __init__(self):
         rospy.init_node("panels", anonymous=False)
         self.veh = os.environ.get("VEHICLE_NAME", "entebot208")
 
         # Geometry
-        self.WORK_W, self.WORK_H = 640, 480
-        self.PANEL_W, self.PANEL_H = 320, 240
+        self.WORK_W, self.WORK_H = 320, 240
+        self.PANEL_W, self.PANEL_H = 160, 120
 
         # ---- Vision tunables ---------------------------------------------
         self.roi_top_ratio    = float(rospy.get_param("~roi_top_ratio",   0.50))
         self.lookahead_ratio  = float(rospy.get_param("~lookahead_ratio", 0.55))
-        self.display_rate     = float(rospy.get_param("~display_rate",   15.0))
-        self.control_rate     = float(rospy.get_param("~control_rate",   30.0))
+        self.display_rate     = float(rospy.get_param("~display_rate",   8.0))
+        self.control_rate     = float(rospy.get_param("~control_rate",   20.0))
 
         self.yellow_lo = np.array([20,  70, 100], dtype=np.uint8)
         self.yellow_hi = np.array([35, 255, 255], dtype=np.uint8)
         self.white_lo  = np.array([ 0,   0, 180], dtype=np.uint8)
         self.white_hi  = np.array([179, 55, 255], dtype=np.uint8)
 
-        self.min_yellow_area = 30
-        self.min_white_area  = 150
+        self.min_yellow_area = 10
+        self.min_white_area  = 40
         self.canny_lo, self.canny_hi = 60, 160
         self.kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         self.deadband = 8
@@ -99,18 +97,20 @@ class LanePanelsDrive:
         self.Kd             = float(rospy.get_param("~kd",             0.4))
         self.omega_max      = float(rospy.get_param("~omega_max",      4.0))
         self.omega_slew      = float(rospy.get_param("~omega_slew",     15.0))
+        self.omega_min_turn  = float(rospy.get_param("~omega_min_turn",  1.2))   # rad/s floor
+        self.turn_eps        = float(rospy.get_param("~turn_eps",        0.12))  # |e| to engage
         self.turn_slowdown  = float(rospy.get_param("~turn_slowdown",  0.6))
         self.d_alpha        = float(rospy.get_param("~d_alpha",        0.5))
         self.omega_sign     = float(rospy.get_param("~omega_sign",    -1.0))
         self.lost_timeout   = float(rospy.get_param("~lost_timeout",   0.6))
         # FIX 6b: lateral trim. NEGATIVE pulls target left (off the white line).
-        self.center_offset_px = float(rospy.get_param("~center_offset_px", -25.0))
+        self.center_offset_px = float(rospy.get_param("~center_offset_px", -12.0))
         # ---- Persistent vision state ------------------------------------
         self.yellow_line    = None
         self.white_line     = None
         self.smooth_center_x = None
         # FIX 6a: set this to the half_w value you read from the diagnostic log.
-        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 135.0))
+        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 67.0))
         self.yellow_seen    = False
         self.white_seen     = False
 
@@ -183,15 +183,16 @@ class LanePanelsDrive:
         return img
 
     def _placeholder(self, text):
-        ph = np.full((2 * self.PANEL_H, 3 * self.PANEL_W, 3), 40, dtype=np.uint8)
-        cv2.putText(ph, text, (40, self.PANEL_H), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0, (200, 200, 200), 2, cv2.LINE_AA)
+        # Updated to span 2 panels instead of 6
+        ph = np.full((self.PANEL_H, 2 * self.PANEL_W, 3), 40, dtype=np.uint8)
+        cv2.putText(ph, text, (40, self.PANEL_H // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (200, 200, 200), 2, cv2.LINE_AA)
         return ph
 
     # ======================================================================
     #  Control: lane-center pixel error -> (v, omega)
     # ======================================================================
-    def _compute_control(self, error_px, lane_half_width_px, lane_seen):
+    def _compute_control(self, error_px, lane_half_
         now = rospy.get_time()
         if lane_seen:
             self._last_seen_t = now
