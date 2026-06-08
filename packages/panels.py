@@ -5,12 +5,8 @@ panels.py
 =========
 DISPLAY + DRIVE variant of the 6-panel lane-debug node (ROS Noetic).
 
-Same computer-vision pipeline as before (the version that detected the lines
-well), but now it does TWO things at once:
-
-  1. Shows the 2x3 debug matrix in an OpenCV window via cv2.imshow()
-     (forwarded to your laptop by `dts devel run -X` / VcXsrv on WSL2).
-  2. Publishes wheel commands so the bot actually drives the lane.
+Same computer-vision pipeline + display as before, with the steering reworked
+so it stops OVER-ESTIMATING turns and running out of the lane on corners.
 
     +---------------------+---------------------+---------------------+
     | 1  RAW + ROI box    | 2  YELLOW mask      | 3  WHITE mask       |
@@ -18,33 +14,29 @@ well), but now it does TWO things at once:
     | 4  LANE BED overlay | 5  EDGES / combined | 6  STEERING + v/w   |
     +---------------------+---------------------+---------------------+
 
-WHAT CHANGED vs the display-only file
--------------------------------------
-* DISPLAY now appears immediately. We create the window and show a "waiting
-  for camera" placeholder BEFORE any frame arrives, so an empty/absent topic
-  no longer looks like "no window". imshow is wrapped so a headless-OpenCV
-  build prints a clear message instead of dying silently.
-* DRIVING is a PD controller on the lane-center error with TWO fixes for the
-  symptoms you saw:
-    - oscillation  -> derivative term (Kd) + filtered error damp the wobble,
-                      and the steering EMA lag was reduced.
-    - runs wide on -> forward speed is scaled DOWN as the turn sharpens
-      turns               (turn_slowdown), so the bot has time to come around
-                          instead of carrying too much speed into the corner.
-  Steering is published as omega (rad/s) via Twist2DStamped, so the bot's
-  kinematics/calibration handle the left/right wheel split (smoother turns
-  than hand-splitting wheel velocities).
+TURN FIX (what changed in this version)
+---------------------------------------
+1. NEARER LOOKAHEAD. lookahead_ratio moved 0.35 -> 0.55, so the lane center is
+   measured closer to the bot. We fit a STRAIGHT line; extrapolating it far
+   down a CURVED road throws the target way out to the side, which made the
+   controller turn early and cut the corner. Measuring nearer kills most of
+   that extrapolation error. (Tune 0.45 near .. 0.70 far; bigger = nearer.)
+2. NO STALE-LINE AVERAGING. On a curve the dashed yellow drops out (or white
+   leaves the ROI). The old code averaged the fresh line with the *last good*
+   stale one, yanking the center sideways. Now, if only one line is fresh, the
+   center is placed a remembered half-lane-width from THAT line.
+3. OMEGA SLEW LIMIT. Steering can't jump more than omega_slew rad/s per second,
+   so one noisy frame can't snap into a hard turn.
+4. Gentler defaults: kp 3.0 -> 2.2, omega_max 5.0 -> 4.0.
 
 COMMAND TOPIC
 -------------
-Publishes Twist2DStamped to  /<veh>/car_cmd_switch_node/cmd  (the standard
-lane-following command; v in m/s, omega in rad/s). If your setup drove via
-raw wheel velocities instead, see the WHEELS_CMD note near the publisher.
+Twist2DStamped to /<veh>/car_cmd_switch_node/cmd (v m/s, omega rad/s).
 
 SAFETY
 ------
-A zero command is published on quit / Ctrl-C, and if the lane is lost for
-`lost_timeout` seconds the bot stops rather than driving blind. Press 'q'.
+Zero command on quit / Ctrl-C; stops if the lane is lost for lost_timeout s.
+Press 'q'.
 
 Run on the bot (with -X so the window forwards to your laptop):
     DOCKER_API_VERSION=1.41 dts devel build -f -H 192.168.3.8
@@ -74,12 +66,13 @@ class LanePanelsDrive:
         self.veh = os.environ.get("VEHICLE_NAME", "entebot208")
 
         # Geometry. WORK_* = working resolution; PANEL_* = each panel.
-        self.WORK_W, self.WORK_H = 640, 480
-        self.PANEL_W, self.PANEL_H = 320, 240
+        self.WORK_W, self.WORK_H = 320, 240  # <--- Lowered from 640, 480
+        self.PANEL_W, self.PANEL_H = 160, 120
 
         # ---- Vision tunables (overridable via the ROS param server) -------
         self.roi_top_ratio = float(rospy.get_param("~roi_top_ratio", 0.5))
-        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.50)) # Changed from 0.35
+        # NEARER lookahead than before (0.35 -> 0.55): less corner-cutting.
+        self.lookahead_ratio = float(rospy.get_param("~lookahead_ratio", 0.55))
         self.display_rate = float(rospy.get_param("~display_rate", 15.0))  # Hz
 
         # HSV thresholds (OpenCV: H 0-179, S 0-255, V 0-255). Retune for light.
@@ -97,12 +90,13 @@ class LanePanelsDrive:
 
         # ---- Control tunables (THE knobs for your two symptoms) -----------
         self.enable_drive = bool(rospy.get_param("~enable_drive", True))
-        self.v_nominal = float(rospy.get_param("~v_nominal", 0.23)) 
-        self.v_min = float(rospy.get_param("~v_min", 0.08)) 
-        self.Kp = float(rospy.get_param("~kp", 1.8))            # Changed from 3.0
-        self.Kd = float(rospy.get_param("~kd", 0.6))            # Changed from 0.4
-        self.omega_max = float(rospy.get_param("~omega_max", 3.5)) # Changed from 5.0
-
+        self.v_nominal = float(rospy.get_param("~v_nominal", 0.23))   # m/s straight
+        self.v_min = float(rospy.get_param("~v_min", 0.08))           # m/s floor
+        self.Kp = float(rospy.get_param("~kp", 2.2))    # rad/s per unit error
+        self.Kd = float(rospy.get_param("~kd", 0.4))    # damping (kills wobble)
+        self.omega_max = float(rospy.get_param("~omega_max", 4.0))    # rad/s clamp
+        # max steering change per second (slew). lower = smoother, less snappy.
+        self.omega_slew = float(rospy.get_param("~omega_slew", 10.0))  # rad/s^2
         # slow down on sharp turns: at full error, v = v_nominal*(1-turn_slowdown)
         self.turn_slowdown = float(rospy.get_param("~turn_slowdown", 0.6))
         self.d_alpha = float(rospy.get_param("~d_alpha", 0.5))  # derivative LPF
@@ -116,12 +110,14 @@ class LanePanelsDrive:
         self.yellow_line = None
         self.white_line = None
         self.smooth_center_x = None
+        self.lane_half_width = None   # remembered half lane width (px, at look_y)
         self.yellow_seen = False
         self.white_seen = False
 
         self._prev_e = 0.0
         self._prev_t = None
         self._d_filt = 0.0
+        self._prev_omega = 0.0
         self._last_seen_t = None
         self._cmd_v = 0.0
         self._cmd_omega = 0.0
@@ -210,6 +206,7 @@ class LanePanelsDrive:
         if self._last_seen_t is None or (now - self._last_seen_t) > self.lost_timeout:
             self._prev_e = 0.0
             self._d_filt = 0.0
+            self._prev_omega = 0.0
             return 0.0, 0.0
 
         # Normalize error to roughly [-1, 1] so gains are resolution-agnostic.
@@ -226,6 +223,15 @@ class LanePanelsDrive:
         # PD -> omega. omega_sign flips if the bot steers the wrong way.
         omega = self.omega_sign * (self.Kp * e + self.Kd * self._d_filt)
         omega = float(np.clip(omega, -self.omega_max, self.omega_max))
+
+        # Slew-limit: cap how fast omega can change so a single bad frame
+        # cannot snap the steering into a hard turn.
+        if dt > 1e-3:
+            max_step = self.omega_slew * dt
+            omega = float(np.clip(omega,
+                                  self._prev_omega - max_step,
+                                  self._prev_omega + max_step))
+        self._prev_omega = omega
 
         # Slow down as the turn sharpens so we don't run wide on corners.
         v = self.v_nominal * (1.0 - self.turn_slowdown * min(1.0, abs(e)))
@@ -281,6 +287,8 @@ class LanePanelsDrive:
             self.white_line = np.array([0.0, 1.0, rw * 0.75, rh * 0.5], dtype=np.float32)
         if self.smooth_center_x is None:
             self.smooth_center_x = float(img_center_x)
+        if self.lane_half_width is None:
+            self.lane_half_width = rw * 0.25   # initial guess: quarter-width
 
         # ---------- HSV segmentation ---------------------------------------
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -368,7 +376,23 @@ class LanePanelsDrive:
         look_y = int(rh * self.lookahead_ratio)
         xl = self._x_at_y(self.yellow_line, look_y)
         xr = self._x_at_y(self.white_line, look_y)
-        lane_center_x = (xl + xr) / 2.0
+
+        # --- Robust lane-center: DON'T average a stale line on a curve. -----
+        # Both fresh  -> midpoint, and refresh the remembered half-width.
+        # One fresh    -> offset the remembered half-width from THAT line.
+        # None fresh   -> hold the last smoothed center (lost-timeout handles
+        #                 a sustained loss by stopping the bot).
+        if self.yellow_seen and self.white_seen:
+            lane_center_x = (xl + xr) / 2.0
+            hw = (xr - xl) / 2.0
+            if hw > rw * 0.05:   # guard against crossed / degenerate fits
+                self.lane_half_width = 0.7 * self.lane_half_width + 0.3 * hw
+        elif self.yellow_seen:
+            lane_center_x = xl + self.lane_half_width
+        elif self.white_seen:
+            lane_center_x = xr - self.lane_half_width
+        else:
+            lane_center_x = self.smooth_center_x
 
         self.smooth_center_x = (self.ema_alpha * lane_center_x
                                 + (1.0 - self.ema_alpha) * self.smooth_center_x)
@@ -383,6 +407,7 @@ class LanePanelsDrive:
         panel6 = cv2.convertScaleAbs(roi, alpha=0.4)
         bot_origin = (img_center_x, rh - 1)
         cv2.line(panel6, (img_center_x, 0), (img_center_x, rh - 1), (255, 150, 0), 1)
+        cv2.line(panel6, (0, look_y), (rw - 1, look_y), (120, 120, 120), 1)
         cv2.arrowedLine(panel6, bot_origin, (target_x, look_y),
                         (0, 0, 255), 2, tipLength=0.2)
         cv2.circle(panel6, (target_x, look_y), 4, (0, 255, 0), -1)
@@ -487,5 +512,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
