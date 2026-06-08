@@ -99,6 +99,7 @@ class LanePanelsDrive:
         self.enable_drive = bool(rospy.get_param("~enable_drive", True))
         self.v_nominal = float(rospy.get_param("~v_nominal", 0.23))   # m/s straight
         self.v_min = float(rospy.get_param("~v_min", 0.08))           # m/s floor
+        self.baseline       = float(rospy.get_param("~baseline",       0.1))
         self.Kp = float(rospy.get_param("~kp", 3.0))    # rad/s per unit error
         self.Kd = float(rospy.get_param("~kd", 0.4))    # damping (kills wobble)
         self.omega_max = float(rospy.get_param("~omega_max", 5.0))    # rad/s clamp
@@ -192,9 +193,10 @@ class LanePanelsDrive:
 
     def _placeholder(self, text):
         # Match the new two-panel layout: 2 wide, 1 tall.
-        ph = np.full((self.PANEL_H, 2 * self.PANEL_W, 3), 40, dtype=np.uint8)
-        cv2.putText(ph, text, (40, self.PANEL_H // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0, (200, 200, 200), 2, cv2.LINE_AA)
+              # Single-panel layout.
+        ph = np.full((self.PANEL_H, self.PANEL_W, 3), 40, dtype=np.uint8)
+        cv2.putText(ph, text, (10, self.PANEL_H // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, (200, 200, 200), 2, cv2.LINE_AA)
         return ph
 
 
@@ -324,39 +326,6 @@ class LanePanelsDrive:
         panel2 = yellow_mask
         panel3 = white_mask
 
-        # ---------- PANEL 4: lane-bed overlay ------------------------------
-        panel4 = roi.copy()
-        y_top, y_bot = 0, rh - 1
-        cv2.line(panel4,
-                 (self._x_at_y(self.yellow_line, y_top), y_top),
-                 (self._x_at_y(self.yellow_line, y_bot), y_bot),
-                 (0, 200, 200), 1)
-        cv2.line(panel4,
-                 (self._x_at_y(self.white_line, y_top), y_top),
-                 (self._x_at_y(self.white_line, y_bot), y_bot),
-                 (200, 200, 200), 1)
-
-        n_bands = 6
-        for i in range(n_bands):
-            y = int(rh * (i + 0.5) / n_bands)
-            xl = int(np.clip(self._x_at_y(self.yellow_line, y), 0, rw - 1))
-            xr = int(np.clip(self._x_at_y(self.white_line, y), 0, rw - 1))
-            cv2.line(panel4, (xl, y), (xr, y), (0, 255, 0), 1)
-            xc = (xl + xr) // 2
-            cv2.circle(panel4, (xc, y), 2, (0, 0, 255), -1)
-
-        for cen in yellow_centroids:
-            cv2.circle(panel4, cen, 3, (0, 255, 255), -1)
-        if white_centroid is not None:
-            cv2.circle(panel4, white_centroid, 3, (255, 255, 255), -1)
-
-        if not self.yellow_seen:
-            cv2.putText(panel4, "Y:last", (4, rh - 6), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (0, 255, 255), 1, cv2.LINE_AA)
-        if not self.white_seen:
-            cv2.putText(panel4, "W:last", (rw - 70, rh - 6), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (255, 255, 255), 1, cv2.LINE_AA)
-
         # ---------- PANEL 6: steering indicator + control ------------------
         look_y = int(rh * self.lookahead_ratio)
         xl = self._x_at_y(self.yellow_line, look_y)
@@ -395,8 +364,7 @@ class LanePanelsDrive:
 
         # ---------- Assemble 2x3 matrix ------------------------------------
         # Only two panels now: 4 (lane bed) and 6 (steering), side by side.
-        return np.hstack([self._format_panel(panel4, "4 LANE BED"),
-                          self._format_panel(panel6, "6 STEERING")])
+        return np.hstack(self._format_panel(panel6, "6 STEERING"))
 
 
     # ======================================================================
