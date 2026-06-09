@@ -5,7 +5,7 @@ panels.py
 =========
 DISPLAY + DRIVE variant of the lane-debug node (ROS Noetic).
 
-Shows ONLY the steering panel:
+Now shows ONLY the steering panel:
 
     +---------------------+
     | 6  STEERING + v/w   |
@@ -26,10 +26,8 @@ FIX 6 — NOT CENTERED / HUGS WHITE: once-a-second diagnostic log of the
 FIX 8 — INNER WHEEL STALLS ON FRICTION: when a real turn is commanded
         (|e| > turn_eps) force |omega| up to omega_min_turn so the inner
         wheel clears the motor dead zone; the slew limiter still ramps in.
-FIX 9 — LEFT YELLOW LINE OUT OF VIEW: when only white is seen (typical on a
-        sharp left turn, where the dashed centerline leaves the frame), push
-        the target further LEFT by ~yellow_lost_push_px so the bot turns
-        harder into the corner.
+FIX 9 — INNER EDGES: Fits lines to the rightmost edge of the yellow lane and 
+        the leftmost edge of the white lane instead of their center masses.
 
 PERFORMANCE
 -----------
@@ -94,33 +92,23 @@ class LanePanelsDrive:
         self.enable_drive   = bool (rospy.get_param("~enable_drive",   True))
         self.v_nominal      = float(rospy.get_param("~v_nominal",      0.23))
         self.v_min          = float(rospy.get_param("~v_min",          0.08))
-        # Wheel-base (m) for the differential-drive split used to SHOW wheel
-        # speeds. ~0.1 m is the Duckiebot default; set ~baseline to yours.
         self.baseline       = float(rospy.get_param("~baseline",       0.1))
         self.Kp             = float(rospy.get_param("~kp",             2.2))
         self.Kd             = float(rospy.get_param("~kd",             0.4))
         self.omega_max      = float(rospy.get_param("~omega_max",      4.0))
         self.omega_slew     = float(rospy.get_param("~omega_slew",     15.0))
-        # FIX 8: beat motor static friction. When a real turn is commanded but
-        # the PD omega is too weak, the inner wheel sits near zero and stalls.
-        # Force |omega| up to a decisive floor so the wheel actually drives.
-        self.omega_min_turn = float(rospy.get_param("~omega_min_turn",  1.2))   # rad/s floor
-        self.turn_eps       = float(rospy.get_param("~turn_eps",        0.12))  # |e| to engage
+        self.omega_min_turn = float(rospy.get_param("~omega_min_turn",  1.2))
+        self.turn_eps       = float(rospy.get_param("~turn_eps",        0.12))
         self.turn_slowdown  = float(rospy.get_param("~turn_slowdown",  0.6))
         self.d_alpha        = float(rospy.get_param("~d_alpha",        0.5))
         self.omega_sign     = float(rospy.get_param("~omega_sign",    -1.0))
         self.lost_timeout   = float(rospy.get_param("~lost_timeout",   0.6))
-        # FIX 6b: lateral trim. NEGATIVE pulls target left (toward yellow).
         self.center_offset_px = float(rospy.get_param("~center_offset_px", -25.0))
-        # FIX 9: when the LEFT yellow line drops out of view (typical on a sharp
-        # left turn), push the target further LEFT so the bot turns harder.
-        self.yellow_lost_push_px = float(rospy.get_param("~yellow_lost_push_px", 40.0))
 
         # ---- Persistent vision state ------------------------------------
         self.yellow_line    = None
         self.white_line     = None
         self.smooth_center_x = None
-        # FIX 6a: set this to the half_w value you read from the diagnostic log.
         self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 135.0))
         self.yellow_seen    = False
         self.white_seen     = False
@@ -166,11 +154,33 @@ class LanePanelsDrive:
         return cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
 
     @staticmethod
-    def _centroid(contour):
-        m = cv2.moments(contour)
-        if m["m00"] == 0:
+    def _extract_edge_points(contours, edge):
+        """
+        Extracts the inner-most pixel for each Y row across all given contours.
+        edge='right' grabs the max X for each Y (inner edge of yellow lane).
+        edge='left' grabs the min X for each Y (inner edge of white lane).
+        """
+        if not contours:
             return None
-        return (int(m["m10"] / m["m00"]), int(m["m01"] / m["m00"]))
+        
+        edge_dict = {}
+        for c in contours:
+            for pt in c:
+                x, y = int(pt[0][0]), int(pt[0][1])
+                if y not in edge_dict:
+                    edge_dict[y] = x
+                else:
+                    if edge == 'right':
+                        edge_dict[y] = max(edge_dict[y], x)
+                    elif edge == 'left':
+                        edge_dict[y] = min(edge_dict[y], x)
+
+        if len(edge_dict) < 2:
+            return None
+
+        # Convert back to (N, 1, 2) float32 array required by cv2.fitLine
+        pts = np.array([[[x, y]] for y, x in edge_dict.items()], dtype=np.float32)
+        return pts
 
     @staticmethod
     def _x_at_y(line, y):
@@ -194,7 +204,6 @@ class LanePanelsDrive:
         return img
 
     def _placeholder(self, text):
-        # Single-panel layout.
         ph = np.full((self.PANEL_H, self.PANEL_W, 3), 40, dtype=np.uint8)
         cv2.putText(ph, text, (10, self.PANEL_H // 2), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (200, 200, 200), 2, cv2.LINE_AA)
@@ -225,9 +234,6 @@ class LanePanelsDrive:
         omega = self.omega_sign * (self.Kp * e + self.Kd * self._d_filt)
         omega = float(np.clip(omega, -self.omega_max, self.omega_max))
 
-        # FIX 8: friction floor — if we genuinely want to turn, make omega
-        # decisive enough to move the inner wheel. The slew limiter below still
-        # ramps into it smoothly, so this doesn't cause a snap.
         if abs(e) > self.turn_eps and abs(omega) > 1e-6:
             omega = float(np.copysign(max(abs(omega), self.omega_min_turn), omega))
 
@@ -258,7 +264,7 @@ class LanePanelsDrive:
             pass
 
     # ======================================================================
-    #  Camera callback — lightweight: decode + stash only.
+    #  Camera callback
     # ======================================================================
     def image_callback(self, msg):
         try:
@@ -272,7 +278,7 @@ class LanePanelsDrive:
             rospy.loginfo("[panels] first camera frame received -- pipeline live")
 
     # ======================================================================
-    #  CV + control pipeline (runs in background thread)
+    #  CV + control pipeline
     # ======================================================================
     def process_frame(self, frame):
         h, w = frame.shape[:2]
@@ -294,26 +300,20 @@ class LanePanelsDrive:
         yellow_mask = self._clean_mask(cv2.inRange(hsv, self.yellow_lo, self.yellow_hi))
         white_mask  = self._clean_mask(cv2.inRange(hsv, self.white_lo,  self.white_hi))
 
-        # Yellow line: fit through dash centroids
-        yellow_centroids = []
-        for c in self._find_contours(yellow_mask):
-            if cv2.contourArea(c) >= self.min_yellow_area:
-                cen = self._centroid(c)
-                if cen is not None:
-                    yellow_centroids.append(cen)
-        if len(yellow_centroids) >= 2:
-            pts = np.array(yellow_centroids, dtype=np.float32)
-            self.yellow_line = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+        # Yellow line: fit through inner edge (right-most points)
+        yellow_contours = [c for c in self._find_contours(yellow_mask) if cv2.contourArea(c) >= self.min_yellow_area]
+        yellow_pts = self._extract_edge_points(yellow_contours, edge='right')
+        if yellow_pts is not None:
+            self.yellow_line = cv2.fitLine(yellow_pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
             self.yellow_seen = True
         else:
             self.yellow_seen = False
 
-        # White line: fit through largest contour
-        white_contours  = [c for c in self._find_contours(white_mask)
-                           if cv2.contourArea(c) >= self.min_white_area]
-        if white_contours:
-            largest = max(white_contours, key=cv2.contourArea)
-            self.white_line = cv2.fitLine(largest, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+        # White line: fit through inner edge (left-most points)
+        white_contours = [c for c in self._find_contours(white_mask) if cv2.contourArea(c) >= self.min_white_area]
+        white_pts = self._extract_edge_points(white_contours, edge='left')
+        if white_pts is not None:
+            self.white_line = cv2.fitLine(white_pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
             self.white_seen = True
         else:
             self.white_seen = False
@@ -331,15 +331,13 @@ class LanePanelsDrive:
         elif self.yellow_seen:
             lane_center_x = xl + self.lane_half_width
         elif self.white_seen:
-            # FIX 9: yellow (left) is gone -> bias the target LEFT to turn harder.
-            lane_center_x = xr - self.lane_half_width - self.yellow_lost_push_px
+            lane_center_x = xr - self.lane_half_width
         else:
             lane_center_x = self.smooth_center_x
 
         self.smooth_center_x = (self.ema_alpha * lane_center_x
                                 + (1.0 - self.ema_alpha) * self.smooth_center_x)
 
-        # FIX 6b: apply lateral trim, then compute error vs image center.
         target_x = int(np.clip(self.smooth_center_x + self.center_offset_px, 0, rw - 1))
         error    = target_x - img_center_x
 
@@ -347,7 +345,6 @@ class LanePanelsDrive:
         v, omega   = self._compute_control(error, self.lane_half_width, lane_seen)
         self._cmd_v, self._cmd_omega = v, omega
 
-        # FIX 6a: once-a-second diagnostic so you can tune half-width/offset.
         rospy.loginfo_throttle(
             1.0,
             "[panels] Y=%d W=%d half_w=%.0f err=%+d v=%.2f w=%+.2f"
@@ -363,9 +360,6 @@ class LanePanelsDrive:
         cv2.circle(panel6, (target_x, look_y), 4, (0, 255, 0), -1)
 
         direction = "STRAIGHT" if abs(error) < self.deadband else ("RIGHT" if error > 0 else "LEFT")
-        # Estimated commanded wheel speeds (m/s) from the v/omega split. The
-        # kinematics node applies gain/trim downstream, so read these as the
-        # left/right BALANCE, not exact motor output.
         vL = v - 0.5 * self.baseline * omega
         vR = v + 0.5 * self.baseline * omega
         cv2.putText(panel6, "L {:.2f}  R {:.2f}".format(vL, vR),
@@ -375,11 +369,10 @@ class LanePanelsDrive:
         cv2.putText(panel6, "v {:.2f}  w {:+.2f}".format(v, omega),
                     (4, rh - 8),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
-        # ---- Single panel: steering only --------------------------------
         return self._format_panel(panel6, "6 STEERING")
 
     # ======================================================================
-    #  _show — display helper (main/GUI thread only)
+    #  _show — display helper
     # ======================================================================
     def _show(self, matrix):
         if self.DISPLAY_SCALE != 1.0:
@@ -395,7 +388,7 @@ class LanePanelsDrive:
                 "-headless) to dependencies-py3.txt and rebuild." % exc)
 
     # ======================================================================
-    #  Control thread: CV + publish, independent of GUI
+    #  Control thread
     # ======================================================================
     def _control_loop(self):
         rate = rospy.Rate(self.control_rate)
@@ -417,7 +410,7 @@ class LanePanelsDrive:
         self._publish_stop()
 
     # ======================================================================
-    #  spin — main (GUI) thread: imshow + waitKey only
+    #  spin
     # ======================================================================
     def spin(self):
         ctrl_thread = threading.Thread(target=self._control_loop, daemon=True)
