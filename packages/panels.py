@@ -3,46 +3,40 @@
 """
 panels.py
 =========
-DISPLAY + DRIVE variant of the lane-debug node (ROS Noetic).
-
-Now shows ONLY the steering panel:
+DISPLAY + DRIVE lane-following node (ROS Noetic). Shows ONE panel:
 
     +---------------------+
     | 6  STEERING + v/w   |
     +---------------------+
 
-On-screen readout (bottom-left of the panel):
-    L / R   estimated left/right wheel speeds (m/s)
-    err     lane-center pixel error + direction
-    v / w   commanded forward speed (m/s) and turn rate (rad/s)
+LANE CENTER (this version)
+--------------------------
+The drivable corridor is bounded by:
+  * the RIGHT edge of the dashed YELLOW centerline (on the bot's left), and
+  * the LEFT edge of the thick WHITE boundary (on the bot's right).
+We measure those two INNER edges directly from the colour masks in a small
+horizontal band at the lookahead row, and steer toward their midpoint:
 
-FIXES IN THIS VERSION
----------------------
-FIX 5 — UNDERSTEERS ON CORNERS: omega_slew = 15.0 rad/s^2 so steering can
-        ramp fast enough to take a corner.
-FIX 6 — NOT CENTERED / HUGS WHITE: once-a-second diagnostic log of the
-        measured half-width + seen lines, and ~center_offset_px lateral trim
-        (NEGATIVE = toward yellow).
-FIX 8 — INNER WHEEL STALLS ON FRICTION: when a real turn is commanded
-        (|e| > turn_eps) force |omega| up to omega_min_turn so the inner
-        wheel clears the motor dead zone; the slew limiter still ramps in.
-FIX 9 — INNER EDGES: Fits lines to the rightmost edge of the yellow lane and 
-        the leftmost edge of the white lane instead of their center masses.
+    target = (yellow_right_edge + white_left_edge) / 2
 
-PERFORMANCE
------------
-DISPLAY_SCALE = 0.5 forwards a quarter-size window; display_rate 8 Hz and
-control_rate 20 Hz lighten CPU/network. Slew and derivative terms use real
-elapsed time, so changing the rate needs no retuning.
+No more "push left when yellow disappears" logic -- this is a clean,
+symmetric center aimed at straight-lane following. If only one edge is
+visible we fall back to a remembered half-corridor width; if neither is
+visible we hold the last target (and the lost-timeout stops the bot).
 
-COMMAND TOPIC
--------------
-Twist2DStamped to /<veh>/car_cmd_switch_node/cmd (v m/s, omega rad/s).
+On-screen (panel 6): yellow dot = yellow inner edge, white dot = white inner
+edge, green dot = target, red arrow = steer direction; text shows err + v/w.
 
-SAFETY
-------
-Zero command on quit / Ctrl-C; stops if the lane is lost for lost_timeout s.
-Press 'q' in the debug window, or Ctrl-C.
+CONTROL: PD on the normalised lane error -> omega; forward speed eases off in
+turns. Steering omega is slew-limited so it can't snap.
+
+COMMAND TOPIC: Twist2DStamped to /<veh>/car_cmd_switch_node/cmd.
+
+DISPLAY: needs X forwarding (dts devel run -X). If X isn't available, run with
+_enable_display:=false to drive headless (no window, no crash).
+
+SAFETY: zero command on quit / Ctrl-C; stops if the lane is lost for
+lost_timeout s. Press 'q' in the window, or Ctrl-C.
 """
 
 import os
@@ -57,10 +51,10 @@ from duckietown_msgs.msg import Twist2DStamped
 
 
 class LanePanelsDrive:
-    """Builds + shows the steering panel AND drives the lane."""
+    """Shows the steering panel AND follows the lane via inner-edge center."""
 
     WINDOW = "lane panels"
-    DISPLAY_SCALE = 0.5   # 0.5 = forward a 160x120 window (1/4 the pixels)
+    DISPLAY_SCALE = 1.0   # lower if the forwarded window is slow
 
     def __init__(self):
         rospy.init_node("panels", anonymous=False)
@@ -73,47 +67,46 @@ class LanePanelsDrive:
         # ---- Vision tunables ---------------------------------------------
         self.roi_top_ratio    = float(rospy.get_param("~roi_top_ratio",   0.50))
         self.lookahead_ratio  = float(rospy.get_param("~lookahead_ratio", 0.55))
-        self.display_rate     = float(rospy.get_param("~display_rate",    8.0))
-        self.control_rate     = float(rospy.get_param("~control_rate",   20.0))
+        self.display_rate     = float(rospy.get_param("~display_rate",   15.0))
+        self.control_rate     = float(rospy.get_param("~control_rate",   30.0))
 
+
+        # HSV thresholds (OpenCV: H 0-179, S 0-255, V 0-255)
         self.yellow_lo = np.array([20,  70, 100], dtype=np.uint8)
         self.yellow_hi = np.array([35, 255, 255], dtype=np.uint8)
         self.white_lo  = np.array([ 0,   0, 180], dtype=np.uint8)
         self.white_hi  = np.array([179, 55, 255], dtype=np.uint8)
+        self.kernel    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-        self.min_yellow_area = 30
-        self.min_white_area  = 150
-        self.canny_lo, self.canny_hi = 60, 160
-        self.kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        self.deadband = 8
+        # Inner-edge detection band around the lookahead row.
+        self.edge_band   = int(rospy.get_param("~edge_band", 15))    # +/- px
+        self.min_edge_px = int(rospy.get_param("~min_edge_px", 20))  # pixels to count
+
+        self.deadband  = 8
         self.ema_alpha = float(rospy.get_param("~ema_alpha", 0.35))
 
         # ---- Control tunables -------------------------------------------
         self.enable_drive   = bool (rospy.get_param("~enable_drive",   True))
         self.v_nominal      = float(rospy.get_param("~v_nominal",      0.23))
         self.v_min          = float(rospy.get_param("~v_min",          0.08))
-        self.baseline       = float(rospy.get_param("~baseline",       0.1))
         self.Kp             = float(rospy.get_param("~kp",             2.2))
         self.Kd             = float(rospy.get_param("~kd",             0.4))
         self.omega_max      = float(rospy.get_param("~omega_max",      4.0))
         self.omega_slew     = float(rospy.get_param("~omega_slew",     15.0))
-        self.omega_min_turn = float(rospy.get_param("~omega_min_turn",  1.2))
-        self.turn_eps       = float(rospy.get_param("~turn_eps",        0.12))
         self.turn_slowdown  = float(rospy.get_param("~turn_slowdown",  0.6))
         self.d_alpha        = float(rospy.get_param("~d_alpha",        0.5))
         self.omega_sign     = float(rospy.get_param("~omega_sign",    -1.0))
         self.lost_timeout   = float(rospy.get_param("~lost_timeout",   0.6))
-        self.center_offset_px = float(rospy.get_param("~center_offset_px", -25.0))
+        # Optional lateral trim (px). 0 = pure inner-edge midpoint.
+        self.center_offset_px = float(rospy.get_param("~center_offset_px", 0.0))
 
-        # ---- Persistent vision state ------------------------------------
-        self.yellow_line    = None
-        self.white_line     = None
+        # ---- Persistent state -------------------------------------------
         self.smooth_center_x = None
-        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 135.0))
-        self.yellow_seen    = False
-        self.white_seen     = False
+        # Fallback half-corridor width (px), self-updates when both edges seen.
+        self.lane_half_width = float(rospy.get_param("~lane_half_width_init", 110.0))
+        self.yellow_seen = False
+        self.white_seen  = False
 
-        # ---- Persistent control state -----------------------------------
         self._prev_e      = 0.0
         self._prev_t      = None
         self._d_filt      = 0.0
@@ -122,7 +115,7 @@ class LanePanelsDrive:
         self._cmd_v       = 0.0
         self._cmd_omega   = 0.0
 
-        # ---- Shared data between threads --------------------------------
+        # ---- Shared between threads -------------------------------------
         self.latest          = None
         self._display_matrix = None
         self._frames         = 0
@@ -139,56 +132,16 @@ class LanePanelsDrive:
         self.pub = rospy.Publisher(self.cmd_topic, Twist2DStamped, queue_size=1)
         rospy.on_shutdown(self._publish_stop)
 
-        rospy.loginfo("[panels] vehicle       = %s", self.veh)
-        rospy.loginfo("[panels] camera topic  = %s", self.cam_topic)
-        rospy.loginfo("[panels] cmd topic     = %s", self.cmd_topic)
-        rospy.loginfo("[panels] DISPLAY env   = %s", os.environ.get("DISPLAY", "(unset!)"))
-        rospy.loginfo("[panels] drive enabled = %s", self.enable_drive)
+        rospy.loginfo("[panels] vehicle        = %s", self.veh)
+        rospy.loginfo("[panels] camera topic   = %s", self.cam_topic)
+        rospy.loginfo("[panels] cmd topic      = %s", self.cmd_topic)
+        rospy.loginfo("[panels] DISPLAY env    = %s", os.environ.get("DISPLAY", "(unset!)"))
+        rospy.loginfo("[panels] drive enabled  = %s", self.enable_drive)
         rospy.loginfo("[panels] press q in the window to quit")
 
     # ======================================================================
     #  Helpers
     # ======================================================================
-    @staticmethod
-    def _find_contours(mask):
-        return cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
-
-    @staticmethod
-    def _extract_edge_points(contours, edge):
-        """
-        Extracts the inner-most pixel for each Y row across all given contours.
-        edge='right' grabs the max X for each Y (inner edge of yellow lane).
-        edge='left' grabs the min X for each Y (inner edge of white lane).
-        """
-        if not contours:
-            return None
-        
-        edge_dict = {}
-        for c in contours:
-            for pt in c:
-                x, y = int(pt[0][0]), int(pt[0][1])
-                if y not in edge_dict:
-                    edge_dict[y] = x
-                else:
-                    if edge == 'right':
-                        edge_dict[y] = max(edge_dict[y], x)
-                    elif edge == 'left':
-                        edge_dict[y] = min(edge_dict[y], x)
-
-        if len(edge_dict) < 2:
-            return None
-
-        # Convert back to (N, 1, 2) float32 array required by cv2.fitLine
-        pts = np.array([[[x, y]] for y, x in edge_dict.items()], dtype=np.float32)
-        return pts
-
-    @staticmethod
-    def _x_at_y(line, y):
-        vx, vy, x0, y0 = line
-        if abs(vy) < 1e-6:
-            return int(x0)
-        return int(x0 + (float(y) - float(y0)) * (vx / vy))
-
     def _clean_mask(self, mask):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self.kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel)
@@ -234,9 +187,6 @@ class LanePanelsDrive:
         omega = self.omega_sign * (self.Kp * e + self.Kd * self._d_filt)
         omega = float(np.clip(omega, -self.omega_max, self.omega_max))
 
-        if abs(e) > self.turn_eps and abs(omega) > 1e-6:
-            omega = float(np.copysign(max(abs(omega), self.omega_min_turn), omega))
-
         if dt > 1e-3:
             max_step = self.omega_slew * dt
             omega = float(np.clip(omega,
@@ -264,7 +214,7 @@ class LanePanelsDrive:
             pass
 
     # ======================================================================
-    #  Camera callback
+    #  Camera callback — lightweight: decode + stash only.
     # ======================================================================
     def image_callback(self, msg):
         try:
@@ -278,20 +228,37 @@ class LanePanelsDrive:
             rospy.loginfo("[panels] first camera frame received -- pipeline live")
 
     # ======================================================================
-    #  CV + control pipeline
+    #  Inner-edge measurement at the lookahead band
+    # ======================================================================
+    def _inner_edges(self, yellow_mask, white_mask, look_y, rh, img_center_x):
+        """Return (yellow_right_edge_x, white_left_edge_x); either may be None."""
+        y0 = max(0, look_y - self.edge_band)
+        y1 = min(rh, look_y + self.edge_band + 1)
+
+        # YELLOW: rightmost yellow pixel in the band = the edge facing the lane.
+        ys_y, ys_x = np.where(yellow_mask[y0:y1, :] > 0)
+        yellow_inner = int(ys_x.max()) if ys_x.size >= self.min_edge_px else None
+
+        # WHITE: leftmost white pixel that lies to the RIGHT of the yellow edge
+        #        (or right of image center if yellow is missing) = inner edge of
+        #        the right-hand boundary.
+        ws_y, ws_x = np.where(white_mask[y0:y1, :] > 0)
+        white_inner = None
+        if ws_x.size >= self.min_edge_px:
+            ref = yellow_inner if yellow_inner is not None else img_center_x
+            right = ws_x[ws_x > ref]
+            if right.size > 0:
+                white_inner = int(right.min())
+        return yellow_inner, white_inner
+
+    # ======================================================================
+    #  CV + control pipeline (runs in background thread)
     # ======================================================================
     def process_frame(self, frame):
         h, w = frame.shape[:2]
-        roi_y1 = int(h * self.roi_top_ratio)
-        roi_y2 = h
-        roi    = frame[roi_y1:roi_y2, 0:w].copy()
+        roi   = frame[int(h * self.roi_top_ratio):h, 0:w].copy()
         rh, rw = roi.shape[:2]
         img_center_x = rw // 2
-
-        if self.yellow_line is None:
-            self.yellow_line = np.array([0.0, 1.0, rw * 0.25, rh * 0.5], dtype=np.float32)
-        if self.white_line is None:
-            self.white_line  = np.array([0.0, 1.0, rw * 0.75, rh * 0.5], dtype=np.float32)
         if self.smooth_center_x is None:
             self.smooth_center_x = float(img_center_x)
 
@@ -300,40 +267,25 @@ class LanePanelsDrive:
         yellow_mask = self._clean_mask(cv2.inRange(hsv, self.yellow_lo, self.yellow_hi))
         white_mask  = self._clean_mask(cv2.inRange(hsv, self.white_lo,  self.white_hi))
 
-        # Yellow line: fit through inner edge (right-most points)
-        yellow_contours = [c for c in self._find_contours(yellow_mask) if cv2.contourArea(c) >= self.min_yellow_area]
-        yellow_pts = self._extract_edge_points(yellow_contours, edge='right')
-        if yellow_pts is not None:
-            self.yellow_line = cv2.fitLine(yellow_pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-            self.yellow_seen = True
-        else:
-            self.yellow_seen = False
-
-        # White line: fit through inner edge (left-most points)
-        white_contours = [c for c in self._find_contours(white_mask) if cv2.contourArea(c) >= self.min_white_area]
-        white_pts = self._extract_edge_points(white_contours, edge='left')
-        if white_pts is not None:
-            self.white_line = cv2.fitLine(white_pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-            self.white_seen = True
-        else:
-            self.white_seen = False
-
-        # ---- Lookahead + robust lane-center -----------------------------
+        # ---- Inner edges at the lookahead band --------------------------
         look_y = int(rh * self.lookahead_ratio)
-        xl     = self._x_at_y(self.yellow_line, look_y)
-        xr     = self._x_at_y(self.white_line,  look_y)
+        yellow_inner, white_inner = self._inner_edges(
+            yellow_mask, white_mask, look_y, rh, img_center_x)
+        self.yellow_seen = yellow_inner is not None
+        self.white_seen  = white_inner  is not None
 
+        # ---- Lane center = midpoint of the two inner edges --------------
         if self.yellow_seen and self.white_seen:
-            lane_center_x = (xl + xr) / 2.0
-            hw = (xr - xl) / 2.0
+            lane_center_x = (yellow_inner + white_inner) / 2.0
+            hw = (white_inner - yellow_inner) / 2.0
             if hw > rw * 0.05:
                 self.lane_half_width = 0.5 * self.lane_half_width + 0.5 * hw
-        elif self.yellow_seen:
-            lane_center_x = xl + self.lane_half_width
         elif self.white_seen:
-            lane_center_x = xr - self.lane_half_width
+            lane_center_x = white_inner - self.lane_half_width
+        elif self.yellow_seen:
+            lane_center_x = yellow_inner + self.lane_half_width
         else:
-            lane_center_x = self.smooth_center_x
+            lane_center_x = self.smooth_center_x   # hold last; lost-timeout stops
 
         self.smooth_center_x = (self.ema_alpha * lane_center_x
                                 + (1.0 - self.ema_alpha) * self.smooth_center_x)
@@ -341,29 +293,28 @@ class LanePanelsDrive:
         target_x = int(np.clip(self.smooth_center_x + self.center_offset_px, 0, rw - 1))
         error    = target_x - img_center_x
 
-        lane_seen  = self.yellow_seen or self.white_seen
-        v, omega   = self._compute_control(error, self.lane_half_width, lane_seen)
+        lane_seen = self.yellow_seen or self.white_seen
+        v, omega  = self._compute_control(error, self.lane_half_width, lane_seen)
         self._cmd_v, self._cmd_omega = v, omega
 
         rospy.loginfo_throttle(
             1.0,
-            "[panels] Y=%d W=%d half_w=%.0f err=%+d v=%.2f w=%+.2f"
-            % (int(self.yellow_seen), int(self.white_seen),
+            "[panels] yL=%s wL=%s half_w=%.0f err=%+d v=%.2f w=%+.2f"
+            % (str(yellow_inner), str(white_inner),
                self.lane_half_width, error, v, omega))
 
-        # ---- Panel 6: steering indicator --------------------------------
+        # ---- Panel 6: steering view -------------------------------------
         panel6 = cv2.convertScaleAbs(roi, alpha=0.4)
         cv2.line(panel6, (img_center_x, 0), (img_center_x, rh - 1), (255, 150, 0), 1)
         cv2.line(panel6, (0, look_y), (rw - 1, look_y), (120, 120, 120), 1)
+        if self.yellow_seen:
+            cv2.circle(panel6, (yellow_inner, look_y), 5, (0, 255, 255), -1)   # yellow edge
+        if self.white_seen:
+            cv2.circle(panel6, (white_inner, look_y), 5, (255, 255, 255), -1)  # white edge
         cv2.arrowedLine(panel6, (img_center_x, rh - 1), (target_x, look_y),
                         (0, 0, 255), 2, tipLength=0.2)
-        cv2.circle(panel6, (target_x, look_y), 4, (0, 255, 0), -1)
-
+        cv2.circle(panel6, (target_x, look_y), 4, (0, 255, 0), -1)             # target
         direction = "STRAIGHT" if abs(error) < self.deadband else ("RIGHT" if error > 0 else "LEFT")
-        vL = v - 0.5 * self.baseline * omega
-        vR = v + 0.5 * self.baseline * omega
-        cv2.putText(panel6, "L {:.2f}  R {:.2f}".format(vL, vR),
-                    (4, rh - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA)
         cv2.putText(panel6, "err {:+d}px {}".format(error, direction),
                     (4, rh - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
         cv2.putText(panel6, "v {:.2f}  w {:+.2f}".format(v, omega),
@@ -372,7 +323,7 @@ class LanePanelsDrive:
         return self._format_panel(panel6, "6 STEERING")
 
     # ======================================================================
-    #  _show — display helper
+    #  _show — display helper (main/GUI thread only)
     # ======================================================================
     def _show(self, matrix):
         if self.DISPLAY_SCALE != 1.0:
@@ -388,7 +339,7 @@ class LanePanelsDrive:
                 "-headless) to dependencies-py3.txt and rebuild." % exc)
 
     # ======================================================================
-    #  Control thread
+    #  Control thread: CV + publish, independent of GUI
     # ======================================================================
     def _control_loop(self):
         rate = rospy.Rate(self.control_rate)
@@ -410,23 +361,22 @@ class LanePanelsDrive:
         self._publish_stop()
 
     # ======================================================================
-    #  spin
+    #  spin — main thread. With display: GUI loop. Headless: just wait.
     # ======================================================================
     def spin(self):
         ctrl_thread = threading.Thread(target=self._control_loop, daemon=True)
         ctrl_thread.start()
 
         cv2.namedWindow(self.WINDOW, cv2.WINDOW_AUTOSIZE)
+
         self._show(self._placeholder("waiting for camera..."))
         cv2.waitKey(1)
 
         gui_rate = rospy.Rate(self.display_rate)
         while not rospy.is_shutdown():
             matrix = self._display_matrix
-            if matrix is not None:
-                self._show(matrix)
-            else:
-                self._show(self._placeholder("waiting for camera..."))
+            self._show(matrix if matrix is not None
+                       else self._placeholder("waiting for camera..."))
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 self._quit = True
                 break
